@@ -103,6 +103,7 @@ namespace
 
     // Present is on the hot path; only the first few calls are logged.
     int g_presentLogBudget = 4;
+    long g_presentCount = 0;
 
     // Set while an exclusive request is being served by a borderless window.
     bool g_active = false;
@@ -590,6 +591,70 @@ namespace
         return blitted;
     }
 
+    // Sample the same 3x3 grid of logical coordinates out of the back buffer and
+    // out of the window client area. Present is being called with a destination
+    // rect the runtime says it honours, yet the shell lands unscaled at the
+    // client origin, so we need to know which surface the shell actually painted.
+    void SampleGrid(HDC dc, char (&out)[192])
+    {
+        out[0] = '\0';
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int col = 0; col < 3; ++col)
+            {
+                const int x = static_cast<int>((g_logicalW * (2 * col + 1)) / 6);
+                const int y = static_cast<int>((g_logicalH * (2 * row + 1)) / 6);
+                const COLORREF pixel = GetPixel(dc, x, y);
+
+                char one[24] = {};
+                if (pixel == CLR_INVALID)
+                    strcpy_s(one, "------ ");
+                else
+                    _snprintf_s(one, sizeof(one), _TRUNCATE, "%06lX ",
+                                static_cast<unsigned long>(pixel & 0x00FFFFFF));
+                strcat_s(out, one);
+            }
+        }
+    }
+
+    void ProbeSurfaces(IDirect3DDevice9* device)
+    {
+        if (!device || !g_gameWindow || g_logicalW <= 0 || g_logicalH <= 0)
+            return;
+
+        char grid[192] = {};
+
+        IDirect3DSurface9* back = nullptr;
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) && back)
+        {
+            HDC backDc = nullptr;
+            const HRESULT hr = back->GetDC(&backDc);
+            if (SUCCEEDED(hr) && backDc)
+            {
+                SampleGrid(backDc, grid);
+                ShimLog("probe: back buffer  %s", grid);
+                back->ReleaseDC(backDc);
+            }
+            else
+            {
+                ShimLog("probe: back buffer GetDC failed hr=0x%08lX", hr);
+            }
+            back->Release();
+        }
+        else
+        {
+            ShimLog("probe: GetBackBuffer failed");
+        }
+
+        HDC windowDc = GetDC(g_gameWindow);
+        if (windowDc)
+        {
+            SampleGrid(windowDc, grid);
+            ShimLog("probe: window client %s", grid);
+            ReleaseDC(g_gameWindow, windowDc);
+        }
+    }
+
     HRESULT STDMETHODCALLTYPE HookPresent(
         IDirect3DDevice9* device,
         const RECT* sourceRect,
@@ -598,6 +663,10 @@ namespace
         const RGNDATA* dirtyRegion)
     {
         const bool scaling = g_active && g_needsPresentRect && !sourceRect && !destRect;
+
+        ++g_presentCount;
+        if (g_presentCount % 200 == 0)
+            ShimLog("fullscreen: %ld Present calls so far", g_presentCount);
 
         if (g_presentLogBudget > 0)
         {
@@ -616,6 +685,8 @@ namespace
                 g_destRect.top,
                 g_destRect.right - g_destRect.left,
                 g_destRect.bottom - g_destRect.top);
+
+            ProbeSurfaces(device);
 
             if (g_presentLogBudget == 0)
                 LogGrantedSwapChain(device, "present");
