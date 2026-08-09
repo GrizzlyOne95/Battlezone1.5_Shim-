@@ -618,14 +618,37 @@ namespace
         const LONG monitorW = g_monitorRect.right - g_monitorRect.left;
         const LONG monitorH = g_monitorRect.bottom - g_monitorRect.top;
 
-        SetWindowPos(
-            g_host,
-            HWND_TOPMOST,
+        if (!SetWindowPos(
+                g_host,
+                HWND_TOPMOST,
+                g_monitorRect.left,
+                g_monitorRect.top,
+                monitorW,
+                monitorH,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW))
+        {
+            ShimLog("mirror: host SetWindowPos failed (err=%lu)", GetLastError());
+        }
+
+        // DWM clips a thumbnail to the destination window's client area, so the
+        // host's real geometry is what actually bounds the image. Report it
+        // rather than assuming it matches the monitor.
+        RECT hostWindow = {};
+        RECT hostClient = {};
+        GetWindowRect(g_host, &hostWindow);
+        GetClientRect(g_host, &hostClient);
+        ShimLog(
+            "mirror: monitor %ld,%ld..%ld,%ld | host window %ld,%ld %ldx%ld | host client %ldx%ld",
             g_monitorRect.left,
             g_monitorRect.top,
-            monitorW,
-            monitorH,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            g_monitorRect.right,
+            g_monitorRect.bottom,
+            hostWindow.left,
+            hostWindow.top,
+            hostWindow.right - hostWindow.left,
+            hostWindow.bottom - hostWindow.top,
+            hostClient.right - hostClient.left,
+            hostClient.bottom - hostClient.top);
 
         if (g_thumbnail)
         {
@@ -665,12 +688,22 @@ namespace
 
         g_mirrorSourceW = sourceSize.cx;
         g_mirrorSourceH = sourceSize.cy;
-        g_mirrorDest = AspectFit(sourceSize.cx, sourceSize.cy, monitorW, monitorH);
+
+        // Hand DWM the whole client area and let it do its own aspect fit. A
+        // hand-computed 4:3 sub-rectangle of a 4:3 client came back rendered at
+        // roughly 1680x2160 instead of 2880x2160, which no aspect fit of a
+        // 640x480 source can produce, so our rectangle was not being used the
+        // way the documentation implies. This removes it from the equation.
+        g_mirrorDest = AspectFit(
+            sourceSize.cx,
+            sourceSize.cy,
+            hostClient.right - hostClient.left,
+            hostClient.bottom - hostClient.top);
 
         DWM_THUMBNAIL_PROPERTIES properties = {};
         properties.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE |
                              DWM_TNP_SOURCECLIENTAREAONLY | DWM_TNP_OPACITY;
-        properties.rcDestination = g_mirrorDest;
+        properties.rcDestination = hostClient;
         properties.fVisible = TRUE;
         properties.fSourceClientAreaOnly = TRUE;
         properties.opacity = 255;
