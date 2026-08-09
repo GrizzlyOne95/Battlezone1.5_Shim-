@@ -12,13 +12,21 @@ namespace
     using CreateDeviceFn = HRESULT (STDMETHODCALLTYPE*)(
         IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
     using ResetFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+    using PresentFn = HRESULT (STDMETHODCALLTYPE*)(
+        IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
     Direct3DCreate9Fn g_realDirect3DCreate9 = nullptr;
     CreateDeviceFn g_realCreateDevice = nullptr;
     ResetFn g_realReset = nullptr;
+    PresentFn g_realPresent = nullptr;
 
     constexpr size_t kIDirect3D9CreateDeviceIndex = 16;
     constexpr size_t kIDirect3DDevice9ResetIndex = 16;
+    constexpr size_t kIDirect3DDevice9PresentIndex = 17;
+
+    bool g_borderlessPresentationActive = false;
+    HWND g_borderlessWindow = nullptr;
+    bool g_loggedPresentScaling = false;
 
     bool PatchPointer(void** slot, void* replacement, void** original)
     {
@@ -41,6 +49,18 @@ namespace
         DWORD ignored = 0;
         VirtualProtect(slot, sizeof(void*), oldProtect, &ignored);
         return true;
+    }
+
+    HWND GetDeviceWindow(IDirect3DDevice9* device)
+    {
+        if (!device)
+            return nullptr;
+
+        D3DDEVICE_CREATION_PARAMETERS creation = {};
+        if (SUCCEEDED(device->GetCreationParameters(&creation)))
+            return creation.hFocusWindow;
+
+        return nullptr;
     }
 
     bool MakeWindowBorderless(HWND hwnd)
@@ -87,8 +107,9 @@ namespace
         converted.Windowed = TRUE;
         converted.FullScreen_RefreshRateInHz = 0;
 
-        // D3DSWAPEFFECT_FLIP is an exclusive-fullscreen-era choice. DISCARD is
-        // the closest normal D3D9 windowed presentation behavior.
+        // Preserve the game's logical backbuffer dimensions. Battlezone's shell
+        // is built around legacy modes such as 640x480; the Present hook below
+        // scales that backbuffer to the desktop-sized borderless client area.
         if (converted.SwapEffect == D3DSWAPEFFECT_FLIP)
             converted.SwapEffect = D3DSWAPEFFECT_DISCARD;
 
@@ -105,6 +126,67 @@ namespace
         return true;
     }
 
+    void SetBorderlessPresentationState(bool active, HWND hwnd)
+    {
+        g_borderlessPresentationActive = active;
+        g_borderlessWindow = active ? hwnd : nullptr;
+        g_loggedPresentScaling = false;
+    }
+
+    HRESULT STDMETHODCALLTYPE HookPresent(
+        IDirect3DDevice9* device,
+        const RECT* sourceRect,
+        const RECT* destRect,
+        HWND destWindowOverride,
+        const RGNDATA* dirtyRegion)
+    {
+        if (!g_realPresent)
+            return D3DERR_INVALIDCALL;
+
+        if (!g_borderlessPresentationActive || destRect)
+            return g_realPresent(device, sourceRect, destRect, destWindowOverride, dirtyRegion);
+
+        HWND targetWindow = destWindowOverride ? destWindowOverride : g_borderlessWindow;
+        if (!targetWindow)
+            targetWindow = GetDeviceWindow(device);
+
+        RECT clientRect = {};
+        if (!targetWindow || !GetClientRect(targetWindow, &clientRect) ||
+            clientRect.right <= clientRect.left || clientRect.bottom <= clientRect.top)
+        {
+            return g_realPresent(device, sourceRect, destRect, destWindowOverride, dirtyRegion);
+        }
+
+        if (!g_loggedPresentScaling)
+        {
+            D3DSURFACE_DESC backBufferDesc = {};
+            IDirect3DSurface9* backBuffer = nullptr;
+            if (device && SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
+            {
+                if (SUCCEEDED(backBuffer->GetDesc(&backBufferDesc)))
+                {
+                    ShimLog(
+                        "fullscreen: scaling Present %ux%u -> client %ldx%ld",
+                        backBufferDesc.Width,
+                        backBufferDesc.Height,
+                        clientRect.right - clientRect.left,
+                        clientRect.bottom - clientRect.top);
+                }
+                backBuffer->Release();
+            }
+            else
+            {
+                ShimLog(
+                    "fullscreen: scaling Present to client %ldx%ld",
+                    clientRect.right - clientRect.left,
+                    clientRect.bottom - clientRect.top);
+            }
+            g_loggedPresentScaling = true;
+        }
+
+        return g_realPresent(device, sourceRect, &clientRect, destWindowOverride, dirtyRegion);
+    }
+
     HRESULT STDMETHODCALLTYPE HookReset(
         IDirect3DDevice9* device,
         D3DPRESENT_PARAMETERS* params)
@@ -113,20 +195,25 @@ namespace
             return g_realReset ? g_realReset(device, params) : D3DERR_INVALIDCALL;
 
         HWND focusWindow = params->hDeviceWindow;
-        if (!focusWindow && device)
-        {
-            D3DDEVICE_CREATION_PARAMETERS creation = {};
-            if (SUCCEEDED(device->GetCreationParameters(&creation)))
-                focusWindow = creation.hFocusWindow;
-        }
+        if (!focusWindow)
+            focusWindow = GetDeviceWindow(device);
 
         D3DPRESENT_PARAMETERS converted = {};
         if (!ConvertExclusiveToBorderless(focusWindow, *params, converted))
-            return g_realReset(device, params);
+        {
+            HRESULT hr = g_realReset(device, params);
+            if (SUCCEEDED(hr))
+                SetBorderlessPresentationState(false, nullptr);
+            return hr;
+        }
 
+        HWND deviceWindow = converted.hDeviceWindow ? converted.hDeviceWindow : focusWindow;
         HRESULT hr = g_realReset(device, &converted);
         if (SUCCEEDED(hr))
+        {
+            SetBorderlessPresentationState(true, deviceWindow);
             return hr;
+        }
 
         // Some older drivers insist on desktop format for windowed reset.
         if (converted.BackBufferFormat != D3DFMT_UNKNOWN)
@@ -136,31 +223,48 @@ namespace
             hr = g_realReset(device, &desktopFormat);
             if (SUCCEEDED(hr))
             {
+                SetBorderlessPresentationState(true, deviceWindow);
                 ShimLog("fullscreen: Reset succeeded after retry with D3DFMT_UNKNOWN");
                 return hr;
             }
         }
 
         ShimLog("fullscreen: borderless Reset failed hr=0x%08lX; falling back to stock exclusive Reset", hr);
-        return g_realReset(device, params);
+        hr = g_realReset(device, params);
+        if (SUCCEEDED(hr))
+            SetBorderlessPresentationState(false, nullptr);
+        return hr;
     }
 
-    void HookDeviceReset(IDirect3DDevice9* device)
+    void HookDeviceMethods(IDirect3DDevice9* device)
     {
         if (!device)
             return;
 
         void** vtable = *reinterpret_cast<void***>(device);
-        void* original = reinterpret_cast<void*>(g_realReset);
-        if (PatchPointer(&vtable[kIDirect3DDevice9ResetIndex], reinterpret_cast<void*>(&HookReset), &original))
+
+        void* originalReset = reinterpret_cast<void*>(g_realReset);
+        if (PatchPointer(&vtable[kIDirect3DDevice9ResetIndex], reinterpret_cast<void*>(&HookReset), &originalReset))
         {
             if (!g_realReset)
-                g_realReset = reinterpret_cast<ResetFn>(original);
+                g_realReset = reinterpret_cast<ResetFn>(originalReset);
             ShimLog("fullscreen: IDirect3DDevice9::Reset hook installed");
         }
         else
         {
             ShimLog("fullscreen: failed to hook IDirect3DDevice9::Reset");
+        }
+
+        void* originalPresent = reinterpret_cast<void*>(g_realPresent);
+        if (PatchPointer(&vtable[kIDirect3DDevice9PresentIndex], reinterpret_cast<void*>(&HookPresent), &originalPresent))
+        {
+            if (!g_realPresent)
+                g_realPresent = reinterpret_cast<PresentFn>(originalPresent);
+            ShimLog("fullscreen: IDirect3DDevice9::Present hook installed");
+        }
+        else
+        {
+            ShimLog("fullscreen: failed to hook IDirect3DDevice9::Present");
         }
     }
 
@@ -180,6 +284,7 @@ namespace
 
         D3DPRESENT_PARAMETERS converted = {};
         const bool wasExclusive = ConvertExclusiveToBorderless(focusWindow, *params, converted);
+        bool usingBorderless = false;
 
         HRESULT hr = g_realCreateDevice(
             d3d,
@@ -189,6 +294,9 @@ namespace
             behaviorFlags,
             wasExclusive ? &converted : params,
             outDevice);
+
+        if (SUCCEEDED(hr) && wasExclusive)
+            usingBorderless = true;
 
         if (FAILED(hr) && wasExclusive && converted.BackBufferFormat != D3DFMT_UNKNOWN)
         {
@@ -204,7 +312,10 @@ namespace
                 outDevice);
 
             if (SUCCEEDED(hr))
+            {
+                usingBorderless = true;
                 ShimLog("fullscreen: CreateDevice succeeded after retry with D3DFMT_UNKNOWN");
+            }
         }
 
         if (FAILED(hr) && wasExclusive)
@@ -218,10 +329,15 @@ namespace
                 behaviorFlags,
                 params,
                 outDevice);
+            usingBorderless = false;
         }
 
         if (SUCCEEDED(hr) && outDevice && *outDevice)
-            HookDeviceReset(*outDevice);
+        {
+            HookDeviceMethods(*outDevice);
+            HWND deviceWindow = converted.hDeviceWindow ? converted.hDeviceWindow : focusWindow;
+            SetBorderlessPresentationState(usingBorderless, usingBorderless ? deviceWindow : nullptr);
+        }
 
         return hr;
     }
