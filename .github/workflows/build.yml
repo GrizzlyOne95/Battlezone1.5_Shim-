@@ -1,0 +1,25 @@
+name: Build Win32 shim
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Win32
+        run: cmake -S . -B build -A Win32
+
+      - name: Build Release
+        run: cmake --build build --config Release
+
+      - name: Upload winmm.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: Battlezone15-Shim-Win32
+          path: build/Release/winmm.dll
