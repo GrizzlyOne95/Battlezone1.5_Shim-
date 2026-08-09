@@ -73,7 +73,7 @@ namespace
         HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         info = {};
         info.cbSize = sizeof(info);
-        return GetMonitorInfoA(monitor, &info) != FALSE;
+        return GetMonitorInfoA(monitor, reinterpret_cast<LPMONITORINFO>(&info)) != FALSE;
     }
 
     void RestoreLegacyDisplayMode()
