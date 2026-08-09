@@ -207,7 +207,7 @@ namespace
         HMODULE self = nullptr;
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCSTR>(&InstallLegacyMovieFix), &self))
+                               reinterpret_cast<LPCSTR>(&g_originalMciSendCommandA), &self))
         {
             char modulePath[4096] = {};
             const DWORD length = GetModuleFileNameA(self, modulePath,
@@ -370,11 +370,8 @@ namespace
             return 0;
         }
 
-        char errorText[160] = {};
-        mciGetErrorStringA(retryResult, errorText, static_cast<UINT>(sizeof(errorText)));
-        ShimLog("movie: compatibility MCI_OPEN failed err=%lu (%s)",
-                static_cast<unsigned long>(retryResult),
-                errorText[0] ? errorText : "unknown error");
+        ShimLog("movie: compatibility MCI_OPEN failed err=%lu",
+                static_cast<unsigned long>(retryResult));
         return result;
     }
 }
