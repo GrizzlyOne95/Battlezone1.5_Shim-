@@ -1,4 +1,5 @@
 #include "fullscreen_fix.h"
+#include "movie_fix.h"
 #include "shim_log.h"
 #include "winmm_proxy.h"
 
@@ -87,6 +88,11 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
                 ShimLog("startup: fullscreen menu compatibility fix active");
             else
                 ShimLog("startup: fullscreen menu fix could not be installed; game remains stock");
+
+            if (InstallLegacyMovieFix())
+                ShimLog("startup: legacy movie compatibility hook active");
+            else
+                ShimLog("startup: legacy movie hook could not be installed");
         }
         else
         {
@@ -95,6 +101,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
+        ShutdownLegacyMovieFix();
         ShutdownFullscreenMenuFix();
         FreeRealWinmm();
         break;
