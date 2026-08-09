@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 #include <mmsystem.h>
+#include <digitalv.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -344,7 +345,7 @@ namespace
         if (!(flags & MCI_OPEN_ELEMENT) || (flags & MCI_OPEN_ELEMENT_ID))
             return result;
 
-        auto* open = reinterpret_cast<MCI_OPEN_PARMSA*>(param);
+        auto* open = reinterpret_cast<MCI_DGV_OPEN_PARMSA*>(param);
         if (!open->lpstrElementName || !*open->lpstrElementName)
             return result;
 
@@ -352,12 +353,18 @@ namespace
         if (!EnsureCompatibleAvi(open->lpstrElementName, cachePath))
             return result;
 
-        MCI_OPEN_PARMSA retry = *open;
+        // Battlezone opens AVIVideo as a digital-video MCI device and supplies
+        // window style/parent fields (MCI_DGV_OPEN_WS / MCI_DGV_OPEN_PARENT).
+        // Preserve the full structure on retry; copying only MCI_OPEN_PARMSA
+        // drops those fields and causes MCIERR_CREATEWINDOW (347).
+        MCI_DGV_OPEN_PARMSA retry = *open;
         retry.wDeviceID = 0;
         retry.lpstrElementName = cachePath.c_str();
 
-        ShimLog("movie: retrying failed MCI_OPEN through compatibility cache for %s",
-                open->lpstrElementName);
+        ShimLog("movie: retrying failed MCI_OPEN through compatibility cache for %s parent=%p style=%08lX",
+                open->lpstrElementName,
+                open->hWndParent,
+                static_cast<unsigned long>(open->dwStyle));
 
         const MCIERROR retryResult = g_originalMciSendCommandA(
             deviceId, message, flags, reinterpret_cast<DWORD_PTR>(&retry));
