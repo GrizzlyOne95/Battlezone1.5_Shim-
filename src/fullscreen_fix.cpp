@@ -85,8 +85,24 @@ namespace
         Center,
     };
 
+    enum class Blit
+    {
+        // Ask Present to stretch the back buffer into the destination rect, and
+        // drop to Gdi permanently if the runtime rejects that.
+        Auto,
+        // Only ever use Present.
+        Present,
+        // Always upscale with StretchBlt from the back buffer's DC. The shell is
+        // GDI content in a lockable 640x480 back buffer, so this always works.
+        Gdi,
+    };
+
     bool g_enabled = true;
     Scaling g_scaling = Scaling::Aspect;
+    Blit g_blit = Blit::Auto;
+
+    // Present is on the hot path; only the first few calls are logged.
+    int g_presentLogBudget = 4;
 
     // Set while an exclusive request is being served by a borderless window.
     bool g_active = false;
@@ -150,10 +166,20 @@ namespace
         else
             g_scaling = Scaling::Aspect;
 
+        char blit[32] = {};
+        GetPrivateProfileStringA("Fullscreen", "Blit", "auto", blit, sizeof(blit), ini);
+        if (_stricmp(blit, "present") == 0)
+            g_blit = Blit::Present;
+        else if (_stricmp(blit, "gdi") == 0)
+            g_blit = Blit::Gdi;
+        else
+            g_blit = Blit::Auto;
+
         ShimLog(
-            "fullscreen: settings mode=%s scaling=%s (%s)",
+            "fullscreen: settings mode=%s scaling=%s blit=%s (%s)",
             g_enabled ? "borderless" : "off",
             scaling,
+            blit,
             ini);
     }
 
@@ -372,6 +398,7 @@ namespace
         g_needsInputMapping = !(destIsWholeClient && g_logicalW == clientW && g_logicalH == clientH);
 
         g_active = true;
+        g_presentLogBudget = 4;
         PinBorderlessWindow(hwnd);
 
         ShimLog(
@@ -459,6 +486,110 @@ namespace
         ShimLog("fullscreen: pillarbox swap chain rejected; falling back to full-client stretch");
     }
 
+    // Report what the runtime actually granted, which is not always what was
+    // asked for, and how big the window really ended up.
+    void LogGrantedSwapChain(IDirect3DDevice9* device, const char* stage)
+    {
+        if (!device)
+            return;
+
+        IDirect3DSwapChain9* chain = nullptr;
+        if (FAILED(device->GetSwapChain(0, &chain)) || !chain)
+        {
+            ShimLog("fullscreen: [%s] could not read swap chain 0", stage);
+            return;
+        }
+
+        D3DPRESENT_PARAMETERS granted = {};
+        if (SUCCEEDED(chain->GetPresentParameters(&granted)))
+        {
+            ShimLog(
+                "fullscreen: [%s] granted %ux%u fmt=%u count=%u swapEffect=%u windowed=%d "
+                "flags=0x%08lX hDeviceWindow=%p",
+                stage,
+                granted.BackBufferWidth,
+                granted.BackBufferHeight,
+                static_cast<unsigned>(granted.BackBufferFormat),
+                granted.BackBufferCount,
+                static_cast<unsigned>(granted.SwapEffect),
+                granted.Windowed ? 1 : 0,
+                granted.Flags,
+                granted.hDeviceWindow);
+        }
+        chain->Release();
+
+        if (g_gameWindow && g_realGetClientRect)
+        {
+            RECT client = {};
+            g_realGetClientRect(g_gameWindow, &client);
+            RECT window = {};
+            GetWindowRect(g_gameWindow, &window);
+            ShimLog(
+                "fullscreen: [%s] real client %ldx%ld, window %ld,%ld %ldx%ld, style=0x%08lX",
+                stage,
+                client.right - client.left,
+                client.bottom - client.top,
+                window.left,
+                window.top,
+                window.right - window.left,
+                window.bottom - window.top,
+                GetWindowLongA(g_gameWindow, GWL_STYLE));
+        }
+    }
+
+    // Upscale by pulling the back buffer's DC and StretchBlt-ing it into the
+    // window. The shell back buffer is created with LOCKABLE_BACKBUFFER (the
+    // game needs that for its own GDI painting), so GetDC is always available
+    // here, and 640x480 -> 2880x2160 once per shell frame is cheap.
+    bool PresentViaGdiStretch(IDirect3DDevice9* device)
+    {
+        if (!device || !g_gameWindow)
+            return false;
+
+        const LONG destW = g_destRect.right - g_destRect.left;
+        const LONG destH = g_destRect.bottom - g_destRect.top;
+        if (destW <= 0 || destH <= 0)
+            return false;
+
+        IDirect3DSurface9* back = nullptr;
+        if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back)
+            return false;
+
+        bool blitted = false;
+        HDC source = nullptr;
+        const HRESULT hr = back->GetDC(&source);
+        if (SUCCEEDED(hr) && source)
+        {
+            HDC target = GetDC(g_gameWindow);
+            if (target)
+            {
+                SetStretchBltMode(target, COLORONCOLOR);
+                blitted = StretchBlt(
+                              target,
+                              g_destRect.left,
+                              g_destRect.top,
+                              destW,
+                              destH,
+                              source,
+                              0,
+                              0,
+                              g_logicalW,
+                              g_logicalH,
+                              SRCCOPY) != FALSE;
+                ReleaseDC(g_gameWindow, target);
+            }
+            back->ReleaseDC(source);
+        }
+        else if (g_presentLogBudget > 0)
+        {
+            --g_presentLogBudget;
+            ShimLog("fullscreen: back buffer GetDC failed hr=0x%08lX; GDI upscale unavailable", hr);
+        }
+
+        back->Release();
+        return blitted;
+    }
+
     HRESULT STDMETHODCALLTYPE HookPresent(
         IDirect3DDevice9* device,
         const RECT* sourceRect,
@@ -466,10 +597,52 @@ namespace
         HWND destWindowOverride,
         const RGNDATA* dirtyRegion)
     {
-        if (g_active && g_needsPresentRect && !sourceRect && !destRect)
-            destRect = &g_destRect;
+        const bool scaling = g_active && g_needsPresentRect && !sourceRect && !destRect;
 
-        return g_realPresent(device, sourceRect, destRect, destWindowOverride, dirtyRegion);
+        if (g_presentLogBudget > 0)
+        {
+            --g_presentLogBudget;
+            ShimLog(
+                "fullscreen: Present active=%d needsRect=%d srcRect=%p dstRect=%p override=%p "
+                "-> scaling=%d blit=%d dest=%ld,%ld %ldx%ld",
+                g_active ? 1 : 0,
+                g_needsPresentRect ? 1 : 0,
+                sourceRect,
+                destRect,
+                destWindowOverride,
+                scaling ? 1 : 0,
+                static_cast<int>(g_blit),
+                g_destRect.left,
+                g_destRect.top,
+                g_destRect.right - g_destRect.left,
+                g_destRect.bottom - g_destRect.top);
+
+            if (g_presentLogBudget == 0)
+                LogGrantedSwapChain(device, "present");
+        }
+
+        if (scaling && g_blit == Blit::Gdi)
+        {
+            if (PresentViaGdiStretch(device))
+                return D3D_OK;
+            // Fall through and let the runtime try, so a frame is never dropped.
+        }
+
+        const HRESULT hr = g_realPresent(
+            device, sourceRect, scaling ? &g_destRect : destRect, destWindowOverride, dirtyRegion);
+
+        if (scaling && FAILED(hr) && g_blit == Blit::Auto)
+        {
+            ShimLog(
+                "fullscreen: Present rejected the destination rect hr=0x%08lX; "
+                "switching to GDI upscale for the rest of this session",
+                hr);
+            g_blit = Blit::Gdi;
+            if (PresentViaGdiStretch(device))
+                return D3D_OK;
+        }
+
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params)
@@ -508,6 +681,7 @@ namespace
         // The game reapplies its own window style and size right after this
         // returns, so re-pin once the device is back.
         PinBorderlessWindow(deviceWindow);
+        LogGrantedSwapChain(device, "reset");
         return hr;
     }
 
@@ -589,7 +763,10 @@ namespace
         {
             HookDeviceMethods(*outDevice);
             if (g_active)
+            {
                 PinBorderlessWindow(deviceWindow);
+                LogGrantedSwapChain(*outDevice, "create");
+            }
         }
 
         return hr;
