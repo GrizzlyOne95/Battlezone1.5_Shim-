@@ -359,7 +359,13 @@ namespace
         // drops those fields and causes MCIERR_CREATEWINDOW (347).
         MCI_DGV_OPEN_PARMSA retry = *open;
         retry.wDeviceID = 0;
-        retry.lpstrElementName = cachePath.c_str();
+
+        // The Win32 digital-video structure declares lpstrElementName as LPSTR,
+        // even though MCI treats the open element name as input. Give it a
+        // writable, call-scoped buffer rather than casting away constness.
+        std::vector<char> retryElement(cachePath.begin(), cachePath.end());
+        retryElement.push_back('\0');
+        retry.lpstrElementName = retryElement.data();
 
         ShimLog("movie: retrying failed MCI_OPEN through compatibility cache for %s parent=%p style=%08lX",
                 open->lpstrElementName,
