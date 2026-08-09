@@ -2,6 +2,7 @@
 #include "shim_log.h"
 
 #include <Windows.h>
+#include <mmsystem.h>
 #include <cstring>
 
 namespace
@@ -205,6 +206,121 @@ namespace
     WINMM_EXPORTS(DECLARE_SLOT)
 #undef DECLARE_SLOT
 
+    using MciSendCommandAFn = MCIERROR (WINAPI*)(MCIDEVICEID, UINT, DWORD_PTR, DWORD_PTR);
+    using MciSendStringAFn = MCIERROR (WINAPI*)(LPCSTR, LPSTR, UINT, HWND);
+    using MciGetErrorStringAFn = BOOL (WINAPI*)(MCIERROR, LPSTR, UINT);
+
+    MciSendCommandAFn g_systemMciSendCommandA = nullptr;
+    MciSendStringAFn g_systemMciSendStringA = nullptr;
+    MciGetErrorStringAFn g_systemMciGetErrorStringA = nullptr;
+    bool g_mciMovieProbeEnabled = false;
+
+    const char* MciMessageName(UINT message)
+    {
+        switch (message)
+        {
+        case MCI_OPEN: return "OPEN";
+        case MCI_CLOSE: return "CLOSE";
+        case MCI_PLAY: return "PLAY";
+        case MCI_SEEK: return "SEEK";
+        case MCI_STOP: return "STOP";
+        case MCI_PAUSE: return "PAUSE";
+        case MCI_RESUME: return "RESUME";
+        case MCI_STATUS: return "STATUS";
+        case MCI_SET: return "SET";
+        case MCI_GETDEVCAPS: return "GETDEVCAPS";
+        case MCI_INFO: return "INFO";
+        case MCI_SYSINFO: return "SYSINFO";
+        default: return "OTHER";
+        }
+    }
+
+    void MciErrorText(MCIERROR error, char text[160])
+    {
+        text[0] = '\0';
+        if (!error)
+        {
+            strcpy_s(text, 160, "success");
+            return;
+        }
+
+        if (g_systemMciGetErrorStringA &&
+            g_systemMciGetErrorStringA(error, text, 160))
+        {
+            return;
+        }
+
+        sprintf_s(text, 160, "unknown MCI error %lu",
+                  static_cast<unsigned long>(error));
+    }
+
+    MCIERROR WINAPI HookMciSendCommandA(MCIDEVICEID deviceId, UINT message,
+                                        DWORD_PTR flags, DWORD_PTR param)
+    {
+        const MCIERROR result = g_systemMciSendCommandA
+            ? g_systemMciSendCommandA(deviceId, message, flags, param)
+            : MCIERR_UNSUPPORTED_FUNCTION;
+
+        if (!g_mciMovieProbeEnabled)
+            return result;
+
+        char errorText[160] = {};
+        MciErrorText(result, errorText);
+
+        if (message == MCI_OPEN && param)
+        {
+            auto* open = reinterpret_cast<MCI_OPEN_PARMSA*>(param);
+            const char* type = "<unspecified>";
+            const char* element = "<unspecified>";
+
+            if ((flags & MCI_OPEN_TYPE) && !(flags & MCI_OPEN_TYPE_ID))
+                type = open->lpstrDeviceType ? open->lpstrDeviceType : "<null>";
+            else if (flags & MCI_OPEN_TYPE_ID)
+                type = "<type-id>";
+
+            if ((flags & MCI_OPEN_ELEMENT) && !(flags & MCI_OPEN_ELEMENT_ID))
+                element = open->lpstrElementName ? open->lpstrElementName : "<null>";
+            else if (flags & MCI_OPEN_ELEMENT_ID)
+                element = "<element-id>";
+
+            ShimLog("movie: MCI command OPEN(A) flags=%08lX type=%s element=%s -> err=%lu (%s) device=%u",
+                    static_cast<unsigned long>(flags), type, element,
+                    static_cast<unsigned long>(result), errorText,
+                    static_cast<unsigned int>(open->wDeviceID));
+        }
+        else
+        {
+            ShimLog("movie: MCI command %s(A) msg=%04X device=%u flags=%08lX param=%p -> err=%lu (%s)",
+                    MciMessageName(message), message,
+                    static_cast<unsigned int>(deviceId),
+                    static_cast<unsigned long>(flags),
+                    reinterpret_cast<void*>(param),
+                    static_cast<unsigned long>(result), errorText);
+        }
+
+        return result;
+    }
+
+    MCIERROR WINAPI HookMciSendStringA(LPCSTR command, LPSTR returnString,
+                                       UINT returnChars, HWND callback)
+    {
+        const MCIERROR result = g_systemMciSendStringA
+            ? g_systemMciSendStringA(command, returnString, returnChars, callback)
+            : MCIERR_UNSUPPORTED_FUNCTION;
+
+        if (g_mciMovieProbeEnabled)
+        {
+            char errorText[160] = {};
+            MciErrorText(result, errorText);
+            ShimLog("movie: MCI string(A) \"%s\" -> err=%lu (%s) return=\"%s\"",
+                    command ? command : "<null>",
+                    static_cast<unsigned long>(result), errorText,
+                    (returnString && returnChars) ? returnString : "");
+        }
+
+        return result;
+    }
+
     FARPROC Resolve(const char* name)
     {
         FARPROC proc = GetProcAddress(g_realWinmm, name);
@@ -236,8 +352,38 @@ bool LoadRealWinmm()
     WINMM_EXPORTS(RESOLVE_SLOT)
 #undef RESOLVE_SLOT
 
+    g_systemMciSendCommandA = reinterpret_cast<MciSendCommandAFn>(g_mciSendCommandA);
+    g_systemMciSendStringA = reinterpret_cast<MciSendStringAFn>(g_mciSendStringA);
+    g_systemMciGetErrorStringA = reinterpret_cast<MciGetErrorStringAFn>(g_mciGetErrorStringA);
+
     ShimLog("winmm: loaded real System32 winmm.dll at %p", g_realWinmm);
     return true;
+}
+
+bool EnableWinmmMciMovieProbe()
+{
+    if (!g_realWinmm || !g_systemMciSendCommandA || !g_systemMciSendStringA)
+    {
+        ShimLog("movie: MCI probe unavailable because required System32 WinMM exports were not resolved");
+        return false;
+    }
+
+    g_mciSendCommandA = reinterpret_cast<FARPROC>(&HookMciSendCommandA);
+    g_mciSendStringA = reinterpret_cast<FARPROC>(&HookMciSendStringA);
+    g_mciMovieProbeEnabled = true;
+
+    ShimLog("movie: WinMM MCI probe active (ANSI command + string APIs)");
+    return true;
+}
+
+void DisableWinmmMciMovieProbe()
+{
+    g_mciMovieProbeEnabled = false;
+
+    if (g_systemMciSendCommandA)
+        g_mciSendCommandA = reinterpret_cast<FARPROC>(g_systemMciSendCommandA);
+    if (g_systemMciSendStringA)
+        g_mciSendStringA = reinterpret_cast<FARPROC>(g_systemMciSendStringA);
 }
 
 void FreeRealWinmm()
