@@ -45,6 +45,8 @@
 #include "shim_log.h"
 
 #include <Windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
 #include <d3d9.h>
 #include <cstdint>
 #include <cstring>
@@ -73,6 +75,9 @@ namespace
 
     enum class Mode
     {
+        // Keep the desktop resolution and mirror the small game window into a
+        // fullscreen host with a DWM thumbnail, forwarding mouse input back.
+        Mirror,
         // Drive the monitor into the mode the game asked for, so the panel
         // upscales the shell dialog the way exclusive fullscreen used to.
         DisplayMode,
@@ -88,6 +93,10 @@ namespace
     bool g_active = false;
     HWND g_gameWindow = nullptr;
     RECT g_windowRect = {};
+
+    // Size the game is actually rendering at, i.e. the mirror source size.
+    LONG g_logicalW = 0;
+    LONG g_logicalH = 0;
 
     struct DisplayModeState
     {
@@ -133,6 +142,8 @@ namespace
             g_mode = Mode::Off;
         else if (_stricmp(mode, "center") == 0 || _stricmp(mode, "centre") == 0)
             g_mode = Mode::Center;
+        else if (_stricmp(mode, "mirror") == 0)
+            g_mode = Mode::Mirror;
         else
             g_mode = Mode::DisplayMode;
 
@@ -369,6 +380,296 @@ namespace
         return true;
     }
 
+    // ---- mirror host --------------------------------------------------------
+    //
+    // The shell is a Win32 dialog, so it cannot be scaled by D3D and it cannot
+    // be re-laid-out. What it can be is *mirrored*: DwmRegisterThumbnail is the
+    // API behind taskbar previews, and DWM will live-composite a top-level
+    // window into an arbitrary destination rectangle, scaled on the GPU, even
+    // while the source is occluded. That covers the owner-drawn dialog and the
+    // MCI video playing behind the menu without knowing anything about either.
+    //
+    // The host is WS_EX_NOACTIVATE, so focus stays on the game window and the
+    // keyboard keeps working untouched. Only the mouse has to be mapped back
+    // out of screen space into the game's 640x480 space and reposted.
+
+    constexpr char kHostClassName[] = "BZ15ShimMirrorHost";
+
+    HWND g_host = nullptr;
+    HTHUMBNAIL g_thumbnail = nullptr;
+    ATOM g_hostClass = 0;
+    RECT g_mirrorDest = {};
+    RECT g_monitorRect = {};
+
+    RECT AspectFit(LONG srcW, LONG srcH, LONG dstW, LONG dstH)
+    {
+        RECT out = { 0, 0, dstW, dstH };
+        if (srcW <= 0 || srcH <= 0)
+            return out;
+
+        const long long byWidth = static_cast<long long>(dstW) * srcH;
+        const long long byHeight = static_cast<long long>(dstH) * srcW;
+
+        LONG width = dstW;
+        LONG height = dstH;
+        if (byWidth > byHeight)
+        {
+            height = dstH;
+            width = static_cast<LONG>(byHeight / srcH);
+        }
+        else
+        {
+            width = dstW;
+            height = static_cast<LONG>(byWidth / srcW);
+        }
+
+        out.left = (dstW - width) / 2;
+        out.top = (dstH - height) / 2;
+        out.right = out.left + width;
+        out.bottom = out.top + height;
+        return out;
+    }
+
+    // Map a point in host client space back into the game's client space, then
+    // walk down to whichever child window actually sits under it so the dialog's
+    // own controls receive coordinates in their own space.
+    void ForwardMouseToGame(UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (!g_gameWindow || !IsWindow(g_gameWindow))
+            return;
+
+        const LONG destW = g_mirrorDest.right - g_mirrorDest.left;
+        const LONG destH = g_mirrorDest.bottom - g_mirrorDest.top;
+        if (destW <= 0 || destH <= 0 || g_logicalW <= 0 || g_logicalH <= 0)
+            return;
+
+        POINT hostPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
+        {
+            // Wheel messages carry screen coordinates.
+            ScreenToClient(g_host, &hostPoint);
+        }
+
+        LONG x = static_cast<LONG>(
+            (static_cast<long long>(hostPoint.x - g_mirrorDest.left) * g_logicalW) / destW);
+        LONG y = static_cast<LONG>(
+            (static_cast<long long>(hostPoint.y - g_mirrorDest.top) * g_logicalH) / destH);
+
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x > g_logicalW - 1) x = g_logicalW - 1;
+        if (y > g_logicalH - 1) y = g_logicalH - 1;
+
+        HWND target = g_gameWindow;
+        POINT local = { x, y };
+        for (int depth = 0; depth < 8; ++depth)
+        {
+            HWND child = ChildWindowFromPointEx(
+                target, local, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+            if (!child || child == target)
+                break;
+
+            POINT screen = local;
+            ClientToScreen(target, &screen);
+            ScreenToClient(child, &screen);
+            local = screen;
+            target = child;
+        }
+
+        if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
+        {
+            POINT screen = local;
+            ClientToScreen(target, &screen);
+            PostMessageA(target, message, wParam,
+                         MAKELPARAM(static_cast<WORD>(screen.x), static_cast<WORD>(screen.y)));
+            return;
+        }
+
+        PostMessageA(target, message, wParam,
+                     MAKELPARAM(static_cast<WORD>(local.x), static_cast<WORD>(local.y)));
+    }
+
+    LRESULT CALLBACK HostWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        switch (message)
+        {
+        case WM_MOUSEACTIVATE:
+            // Never steal focus: the dialog needs to keep the keyboard.
+            return MA_NOACTIVATE;
+
+        case WM_NCHITTEST:
+            return HTCLIENT;
+
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorA(nullptr, IDC_ARROW));
+            return TRUE;
+
+        case WM_ERASEBKGND:
+        {
+            RECT client = {};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client,
+                     reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            return 1;
+        }
+
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+        case WM_MBUTTONDBLCLK:
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+            ForwardMouseToGame(message, wParam, lParam);
+            return 0;
+
+        default:
+            break;
+        }
+
+        return DefWindowProcA(hwnd, message, wParam, lParam);
+    }
+
+    void HideMirror()
+    {
+        if (g_thumbnail)
+        {
+            DwmUnregisterThumbnail(g_thumbnail);
+            g_thumbnail = nullptr;
+        }
+
+        if (g_host && IsWindow(g_host))
+            ShowWindow(g_host, SW_HIDE);
+    }
+
+    void DestroyMirror()
+    {
+        HideMirror();
+
+        if (g_host && IsWindow(g_host))
+            DestroyWindow(g_host);
+        g_host = nullptr;
+    }
+
+    bool EnsureHostWindow()
+    {
+        if (g_host && IsWindow(g_host))
+            return true;
+
+        HINSTANCE instance = GetModuleHandleA(nullptr);
+
+        if (!g_hostClass)
+        {
+            WNDCLASSEXA wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = &HostWndProc;
+            wc.hInstance = instance;
+            wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+            wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            wc.lpszClassName = kHostClassName;
+
+            g_hostClass = RegisterClassExA(&wc);
+            if (!g_hostClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            {
+                ShimLog("mirror: RegisterClassEx failed (err=%lu)", GetLastError());
+                return false;
+            }
+        }
+
+        g_host = CreateWindowExA(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            kHostClassName,
+            "Battlezone",
+            WS_POPUP,
+            g_monitorRect.left,
+            g_monitorRect.top,
+            g_monitorRect.right - g_monitorRect.left,
+            g_monitorRect.bottom - g_monitorRect.top,
+            g_gameWindow,
+            nullptr,
+            instance,
+            nullptr);
+
+        if (!g_host)
+        {
+            ShimLog("mirror: CreateWindowEx failed (err=%lu)", GetLastError());
+            return false;
+        }
+
+        ShimLog("mirror: host window created");
+        return true;
+    }
+
+    bool ShowMirror()
+    {
+        if (!EnsureHostWindow())
+            return false;
+
+        const LONG monitorW = g_monitorRect.right - g_monitorRect.left;
+        const LONG monitorH = g_monitorRect.bottom - g_monitorRect.top;
+
+        SetWindowPos(
+            g_host,
+            HWND_TOPMOST,
+            g_monitorRect.left,
+            g_monitorRect.top,
+            monitorW,
+            monitorH,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+        g_mirrorDest = AspectFit(g_logicalW, g_logicalH, monitorW, monitorH);
+
+        if (g_thumbnail)
+        {
+            DwmUnregisterThumbnail(g_thumbnail);
+            g_thumbnail = nullptr;
+        }
+
+        HRESULT hr = DwmRegisterThumbnail(g_host, g_gameWindow, &g_thumbnail);
+        if (FAILED(hr) || !g_thumbnail)
+        {
+            ShimLog("mirror: DwmRegisterThumbnail failed hr=0x%08lX", hr);
+            ShowWindow(g_host, SW_HIDE);
+            return false;
+        }
+
+        DWM_THUMBNAIL_PROPERTIES properties = {};
+        properties.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE |
+                             DWM_TNP_SOURCECLIENTAREAONLY | DWM_TNP_OPACITY;
+        properties.rcDestination = g_mirrorDest;
+        properties.fVisible = TRUE;
+        properties.fSourceClientAreaOnly = TRUE;
+        properties.opacity = 255;
+
+        hr = DwmUpdateThumbnailProperties(g_thumbnail, &properties);
+        if (FAILED(hr))
+        {
+            ShimLog("mirror: DwmUpdateThumbnailProperties failed hr=0x%08lX", hr);
+            HideMirror();
+            return false;
+        }
+
+        InvalidateRect(g_host, nullptr, TRUE);
+
+        ShimLog(
+            "mirror: mirroring %ldx%ld into %ld,%ld %ldx%ld on a %ldx%ld screen",
+            g_logicalW,
+            g_logicalH,
+            g_mirrorDest.left,
+            g_mirrorDest.top,
+            g_mirrorDest.right - g_mirrorDest.left,
+            g_mirrorDest.bottom - g_mirrorDest.top,
+            monitorW,
+            monitorH);
+
+        return true;
+    }
+
     // ---- window -------------------------------------------------------------
 
     void PinWindow(HWND hwnd)
@@ -430,6 +731,7 @@ namespace
             return;
 
         g_active = false;
+        HideMirror();
         ShimLog("fullscreen: conversion disengaged (%s)", reason);
     }
 
@@ -459,6 +761,8 @@ namespace
         }
 
         g_gameWindow = deviceWindow;
+        g_logicalW = static_cast<LONG>(requested.BackBufferWidth);
+        g_logicalH = static_cast<LONG>(requested.BackBufferHeight);
 
         if (g_mode == Mode::DisplayMode)
         {
@@ -469,8 +773,42 @@ namespace
                 requested.FullScreen_RefreshRateInHz);
         }
 
-        if (!ComputeWindowRect(
-                deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight, g_windowRect))
+        MONITORINFOEXA monitor = {};
+        if (!GetMonitorDevice(deviceWindow, monitor))
+        {
+            ShimLog("fullscreen: could not resolve monitor geometry; leaving the request stock");
+            return false;
+        }
+        g_monitorRect = monitor.rcMonitor;
+
+        bool wantMirror = false;
+
+        if (g_mode == Mode::Mirror)
+        {
+            const LONG monitorW = g_monitorRect.right - g_monitorRect.left;
+            const LONG monitorH = g_monitorRect.bottom - g_monitorRect.top;
+
+            if (g_logicalW >= monitorW && g_logicalH >= monitorH)
+            {
+                // A mission at the native resolution has nothing to magnify, so
+                // the game window just becomes a normal borderless fullscreen.
+                HideMirror();
+                g_windowRect = g_monitorRect;
+            }
+            else
+            {
+                // Park the source window at the monitor origin. It ends up fully
+                // covered by the host, which is fine: DWM keeps compositing
+                // occluded windows, which is what makes taskbar previews work.
+                g_windowRect.left = g_monitorRect.left;
+                g_windowRect.top = g_monitorRect.top;
+                g_windowRect.right = g_windowRect.left + g_logicalW;
+                g_windowRect.bottom = g_windowRect.top + g_logicalH;
+                wantMirror = true;
+            }
+        }
+        else if (!ComputeWindowRect(
+                     deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight, g_windowRect))
         {
             ShimLog("fullscreen: could not resolve monitor geometry; leaving the request stock");
             return false;
@@ -478,6 +816,18 @@ namespace
 
         g_active = true;
         PinWindow(deviceWindow);
+
+        if (wantMirror && !ShowMirror())
+        {
+            // Mirroring is the whole point of this mode, so if DWM refuses,
+            // centre the window rather than leaving it stranded in a corner.
+            ShimLog("mirror: unavailable; falling back to a centred window");
+            if (ComputeWindowRect(
+                    deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight, g_windowRect))
+            {
+                PinWindow(deviceWindow);
+            }
+        }
 
         converted = requested;
         converted.Windowed = TRUE;
@@ -778,5 +1128,6 @@ bool InstallFullscreenMenuFix()
 void ShutdownFullscreenMenuFix()
 {
     Deactivate("shutdown");
+    DestroyMirror();
     RestoreDesktopMode();
 }
