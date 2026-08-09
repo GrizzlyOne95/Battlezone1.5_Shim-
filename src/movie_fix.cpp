@@ -193,7 +193,7 @@ namespace
         SanitizeFileName(base);
 
         char suffix[96] = {};
-        sprintf_s(suffix, "_%08lX%08lX_%08lX%08lX_compat.avi",
+        sprintf_s(suffix, "_%08lX%08lX_%08lX%08lX_compat_v2.avi",
                   static_cast<unsigned long>(info.ftLastWriteTime.dwHighDateTime),
                   static_cast<unsigned long>(info.ftLastWriteTime.dwLowDateTime),
                   static_cast<unsigned long>(info.nFileSizeHigh),
@@ -257,9 +257,12 @@ namespace
         const std::string tempPath = cachePath + ".tmp.avi";
         DeleteFileA(tempPath.c_str());
 
+        // Match the exact codec-free AVI recipe already proven to render in
+        // Battlezone's AnimButton path: uncompressed 24-bit DIB video, no audio.
+        // The explicit DIB handler matters for old MCIAVI/VfW behavior.
         std::string command = QuoteArg(ffmpeg) +
             " -hide_banner -loglevel error -nostdin -y -i " + QuoteArg(sourcePath) +
-            " -c:v rawvideo -pix_fmt bgr24 -c:a pcm_s16le " + QuoteArg(tempPath);
+            " -an -c:v rawvideo -pix_fmt bgr24 -vtag \"DIB \" " + QuoteArg(tempPath);
 
         std::vector<char> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back('\0');
@@ -268,7 +271,7 @@ namespace
         startup.cb = sizeof(startup);
         PROCESS_INFORMATION process = {};
 
-        ShimLog("movie: converting IV50 source to compatibility cache: %s", sourcePath.c_str());
+        ShimLog("movie: converting IV50 source to DIB24 compatibility cache: %s", sourcePath.c_str());
 
         if (!CreateProcessA(ffmpeg.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
                             CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process))
