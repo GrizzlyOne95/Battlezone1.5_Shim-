@@ -401,6 +401,11 @@ namespace
     RECT g_mirrorDest = {};
     RECT g_monitorRect = {};
 
+    // What DWM says it is actually mirroring. Normally the same as the game's
+    // client size, but it is DWM's number that decides the on-screen geometry.
+    LONG g_mirrorSourceW = 0;
+    LONG g_mirrorSourceH = 0;
+
     RECT AspectFit(LONG srcW, LONG srcH, LONG dstW, LONG dstH)
     {
         RECT out = { 0, 0, dstW, dstH };
@@ -622,8 +627,6 @@ namespace
             monitorH,
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-        g_mirrorDest = AspectFit(g_logicalW, g_logicalH, monitorW, monitorH);
-
         if (g_thumbnail)
         {
             DwmUnregisterThumbnail(g_thumbnail);
@@ -637,6 +640,32 @@ namespace
             ShowWindow(g_host, SW_HIDE);
             return false;
         }
+
+        // DWM scales the thumbnail to fit inside rcDestination while preserving
+        // *its own* notion of the source aspect ratio, anchored top-left. If that
+        // notion disagrees with the game's client size the image comes out
+        // letterboxed inside our rectangle and every input coordinate derived
+        // from that rectangle is wrong, so take the size from DWM rather than
+        // assuming it matches the back buffer.
+        SIZE sourceSize = { g_logicalW, g_logicalH };
+        const HRESULT sizeHr = DwmQueryThumbnailSourceSize(g_thumbnail, &sourceSize);
+        if (FAILED(sizeHr) || sourceSize.cx <= 0 || sourceSize.cy <= 0)
+        {
+            ShimLog("mirror: DwmQueryThumbnailSourceSize failed hr=0x%08lX; assuming %ldx%ld",
+                    sizeHr, g_logicalW, g_logicalH);
+            sourceSize.cx = g_logicalW;
+            sourceSize.cy = g_logicalH;
+        }
+        else if (sourceSize.cx != g_logicalW || sourceSize.cy != g_logicalH)
+        {
+            ShimLog(
+                "mirror: DWM reports a %ldx%ld source, not the %ldx%ld client; fitting to DWM's size",
+                sourceSize.cx, sourceSize.cy, g_logicalW, g_logicalH);
+        }
+
+        g_mirrorSourceW = sourceSize.cx;
+        g_mirrorSourceH = sourceSize.cy;
+        g_mirrorDest = AspectFit(sourceSize.cx, sourceSize.cy, monitorW, monitorH);
 
         DWM_THUMBNAIL_PROPERTIES properties = {};
         properties.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE |
@@ -657,9 +686,11 @@ namespace
         InvalidateRect(g_host, nullptr, TRUE);
 
         ShimLog(
-            "mirror: mirroring %ldx%ld into %ld,%ld %ldx%ld on a %ldx%ld screen",
+            "mirror: mirroring %ldx%ld (DWM source %ldx%ld) into %ld,%ld %ldx%ld on a %ldx%ld screen",
             g_logicalW,
             g_logicalH,
+            g_mirrorSourceW,
+            g_mirrorSourceH,
             g_mirrorDest.left,
             g_mirrorDest.top,
             g_mirrorDest.right - g_mirrorDest.left,
