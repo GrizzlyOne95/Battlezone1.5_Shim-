@@ -1,45 +1,50 @@
 // fullscreen_fix.cpp
 //
-// Battlezone 1.5.2.27 renders its shell (main menu, options, mission select)
-// with GDI drawn straight into the Direct3D 9 back buffer: D3D_Get_DC calls
-// IDirect3DSurface9::GetDC on lpBackBuffer, the shell paints text and bitmaps
-// through that HDC, and D3D_Flip releases it before Present. To make that legal
-// in exclusive fullscreen the game calls IDirect3DDevice9::SetDialogBoxMode(TRUE)
-// whenever ResolutionMode == 0 (the 640x480 shell mode).
+// Battlezone 1.5.2.27's shell -- main menu, options, mission select -- is a real
+// Win32 dialog. Read_Shell_Bitmap loads bitmap\*.bmp into a BITMAPINFO, the
+// ShellButton/TextLabel/OptionBox classes owner-draw themselves through an HDC
+// (ShellButton::DrawLabelText takes one), and the whole thing is put on screen by
+// CreateDialogParamA as a child of the game window, driven by ShellDlgProc.
 //
-// GDI-over-exclusive-fullscreen is effectively dead on modern WDDM drivers, so
-// the shell paints nothing and the player has to Alt+Enter into a window to see
-// the menu. Gameplay is unaffected because it is pure D3D with no GDI.
+// That is why D3D_Change_Mode_Ex calls IDirect3DDevice9::SetDialogBoxMode(TRUE)
+// whenever ResolutionMode == 0. The API exists for exactly this: "allows the use
+// of GDI dialog boxes in full-screen mode applications", with the requirement
+// that they be "child to the device window".
 //
-// The fix: never let the game hold an exclusive swap chain. Every exclusive
-// request becomes a windowed one on a borderless window covering the monitor.
-// GDI then works exactly as it does in the windowed mode the player already
-// falls back to, and D3D9 upscales the 640x480 shell back buffer to the screen.
+// On modern WDDM drivers that mechanism no longer works, so under an exclusive
+// swap chain the dialog is simply never composited and the player sees nothing
+// until they Alt+Enter into a window. Missions are unaffected because they are
+// pure D3D with no GDI and go through Present normally -- during the shell the
+// device presents twice and then sits idle.
 //
-// Two things have to be defended after that:
+// Consequences for any fix:
 //
-//   1. D3D_Change_Mode_Ex re-applies its own window style and size immediately
-//      after D3DAppIResetDevice returns. Because it sees Client_Width (640) <
-//      Screen_Width it picks a captioned 640x480 window and undoes the borderless
-//      layout. SetWindowPos / SetWindowLongA / MoveWindow are hooked to pin it.
+//   * The shell cannot be scaled at the D3D layer. Its pixels never pass through
+//     the back buffer, so Present rectangles, stretched blits and back-buffer
+//     upscales all miss it entirely.
 //
-//   2. ProcessMouseMessages derives motion from WM_MOUSEMOVE client coordinates
-//      against Device.Client_Width/Height, which stay at the logical mode size
-//      (640x480). With a 3840x2160 client those coordinates are meaningless, so
-//      mouse messages are scaled back into logical space and GetClientRect /
-//      ClientToScreen are made to agree.
+//   * It cannot be scaled at the Win32 layer either. The layout is fixed-pixel
+//     and the art is 640x480 bitmaps, so resizing the dialog would not reflow it.
+//
+// The only thing that makes a 640x480 dialog fill a 4K screen is the display
+// itself, which is what exclusive fullscreen was implicitly doing all along. So:
+// take the device out of exclusive mode (making the dialog visible again), and
+// put the monitor into the mode the game asked for (making it fill the screen).
+// The panel's own scaler does the upscale, exactly as before.
+//
+// Because the window always ends up the same size as the mode the game asked
+// for, the game's own coordinate maths stays correct and no input remapping is
+// needed anywhere.
 //
 // Settings live in bz15_shim.ini next to bzone.exe:
 //
 //   [Fullscreen]
-//   Mode=borderless   ; borderless (default) | off  -> leave the game stock
-//   Scaling=aspect    ; aspect (default) | stretch | center
+//   Mode=displaymode  ; displaymode (default) | center | off
 
 #include "fullscreen_fix.h"
 #include "shim_log.h"
 
 #include <Windows.h>
-#include <windowsx.h>
 #include <d3d9.h>
 #include <cstdint>
 #include <cstring>
@@ -50,85 +55,52 @@ namespace
     using CreateDeviceFn = HRESULT(STDMETHODCALLTYPE*)(
         IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
     using ResetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
-    using PresentFn = HRESULT(STDMETHODCALLTYPE*)(
-        IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
     using SetWindowPosFn = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
     using SetWindowLongAFn = LONG(WINAPI*)(HWND, int, LONG);
     using MoveWindowFn = BOOL(WINAPI*)(HWND, int, int, int, int, BOOL);
-    using GetClientRectFn = BOOL(WINAPI*)(HWND, LPRECT);
-    using ClientToScreenFn = BOOL(WINAPI*)(HWND, LPPOINT);
-    using GetMessageAFn = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT);
-    using PeekMessageAFn = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT);
 
     constexpr size_t kIDirect3D9CreateDeviceIndex = 16;
     constexpr size_t kIDirect3DDevice9ResetIndex = 16;
-    constexpr size_t kIDirect3DDevice9PresentIndex = 17;
 
     Direct3DCreate9Fn g_realDirect3DCreate9 = nullptr;
     CreateDeviceFn g_realCreateDevice = nullptr;
     ResetFn g_realReset = nullptr;
-    PresentFn g_realPresent = nullptr;
 
     SetWindowPosFn g_realSetWindowPos = nullptr;
     SetWindowLongAFn g_realSetWindowLongA = nullptr;
     MoveWindowFn g_realMoveWindow = nullptr;
-    GetClientRectFn g_realGetClientRect = nullptr;
-    ClientToScreenFn g_realClientToScreen = nullptr;
-    GetMessageAFn g_realGetMessageA = nullptr;
-    PeekMessageAFn g_realPeekMessageA = nullptr;
 
-    enum class Scaling
+    enum class Mode
     {
-        Aspect,
-        Stretch,
+        // Drive the monitor into the mode the game asked for, so the panel
+        // upscales the shell dialog the way exclusive fullscreen used to.
+        DisplayMode,
+        // Leave the desktop alone and just centre a borderless window of the
+        // requested size. The shell stays physically 640x480.
         Center,
+        // Leave the game completely stock.
+        Off,
     };
 
-    enum class Blit
-    {
-        // Ask Present to stretch the back buffer into the destination rect, and
-        // drop to Gdi permanently if the runtime rejects that.
-        Auto,
-        // Only ever use Present.
-        Present,
-        // Always upscale with StretchBlt from the back buffer's DC. The shell is
-        // GDI content in a lockable 640x480 back buffer, so this always works.
-        Gdi,
-    };
+    Mode g_mode = Mode::DisplayMode;
 
-    bool g_enabled = true;
-    Scaling g_scaling = Scaling::Aspect;
-    Blit g_blit = Blit::Auto;
-
-    // Present is on the hot path; only the first few calls are logged.
-    int g_presentLogBudget = 4;
-    long g_presentCount = 0;
-
-    // Set while an exclusive request is being served by a borderless window.
     bool g_active = false;
     HWND g_gameWindow = nullptr;
-
-    // The back buffer size the game asked for; also the coordinate space the
-    // game's shell layout, hit testing and mouse maths all live in.
-    LONG g_logicalW = 0;
-    LONG g_logicalH = 0;
-
-    // Borderless window rect in screen coordinates, and the sub-rectangle of the
-    // client area that the back buffer is presented into.
     RECT g_windowRect = {};
-    RECT g_destRect = {};
 
-    // True when the destination is not the whole client area, which is the only
-    // case where Present needs an explicit rectangle (and therefore COPY).
-    bool g_needsPresentRect = false;
+    struct DisplayModeState
+    {
+        bool captured = false;
+        bool changed = false;
+        char deviceName[CCHDEVICENAME] = {};
+        DEVMODEA original = {};
+    };
 
-    // True when logical space and client space differ at all, i.e. input needs
-    // remapping. False for a native-resolution mission, which stays a passthrough.
-    bool g_needsInputMapping = false;
+    DisplayModeState g_display;
 
-    LONG ClientWidth() { return g_windowRect.right - g_windowRect.left; }
-    LONG ClientHeight() { return g_windowRect.bottom - g_windowRect.top; }
+    LONG WindowWidth() { return g_windowRect.right - g_windowRect.left; }
+    LONG WindowHeight() { return g_windowRect.bottom - g_windowRect.top; }
 
     void BuildIniPath(char (&path)[MAX_PATH])
     {
@@ -155,33 +127,16 @@ namespace
             return;
 
         char mode[32] = {};
-        GetPrivateProfileStringA("Fullscreen", "Mode", "borderless", mode, sizeof(mode), ini);
-        g_enabled = _stricmp(mode, "off") != 0 && _stricmp(mode, "exclusive") != 0;
+        GetPrivateProfileStringA("Fullscreen", "Mode", "displaymode", mode, sizeof(mode), ini);
 
-        char scaling[32] = {};
-        GetPrivateProfileStringA("Fullscreen", "Scaling", "aspect", scaling, sizeof(scaling), ini);
-        if (_stricmp(scaling, "stretch") == 0)
-            g_scaling = Scaling::Stretch;
-        else if (_stricmp(scaling, "center") == 0)
-            g_scaling = Scaling::Center;
+        if (_stricmp(mode, "off") == 0 || _stricmp(mode, "exclusive") == 0)
+            g_mode = Mode::Off;
+        else if (_stricmp(mode, "center") == 0 || _stricmp(mode, "centre") == 0)
+            g_mode = Mode::Center;
         else
-            g_scaling = Scaling::Aspect;
+            g_mode = Mode::DisplayMode;
 
-        char blit[32] = {};
-        GetPrivateProfileStringA("Fullscreen", "Blit", "auto", blit, sizeof(blit), ini);
-        if (_stricmp(blit, "present") == 0)
-            g_blit = Blit::Present;
-        else if (_stricmp(blit, "gdi") == 0)
-            g_blit = Blit::Gdi;
-        else
-            g_blit = Blit::Auto;
-
-        ShimLog(
-            "fullscreen: settings mode=%s scaling=%s blit=%s (%s)",
-            g_enabled ? "borderless" : "off",
-            scaling,
-            blit,
-            ini);
+        ShimLog("fullscreen: settings mode=%s (%s)", mode, ini);
     }
 
     bool PatchPointer(void** slot, void* replacement, void** original)
@@ -263,83 +218,160 @@ namespace
         return false;
     }
 
-    HWND ResolveDeviceWindow(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS* params)
-    {
-        if (params && params->hDeviceWindow)
-            return params->hDeviceWindow;
+    // ---- display mode -------------------------------------------------------
 
-        if (device)
-        {
-            D3DDEVICE_CREATION_PARAMETERS creation = {};
-            if (SUCCEEDED(device->GetCreationParameters(&creation)) && creation.hFocusWindow)
-                return creation.hFocusWindow;
-        }
-
-        return g_gameWindow;
-    }
-
-    bool GetMonitorRect(HWND hwnd, RECT& out)
+    bool GetMonitorDevice(HWND hwnd, MONITORINFOEXA& info)
     {
         if (!hwnd || !IsWindow(hwnd))
             return false;
 
         HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO info = {};
+        info = {};
         info.cbSize = sizeof(info);
-        if (!GetMonitorInfoA(monitor, &info))
+        return GetMonitorInfoA(monitor, reinterpret_cast<LPMONITORINFO>(&info)) != FALSE;
+    }
+
+    void RestoreDesktopMode()
+    {
+        if (!g_display.captured)
+            return;
+
+        if (g_display.changed)
+        {
+            const LONG result = ChangeDisplaySettingsExA(
+                g_display.deviceName, &g_display.original, nullptr, 0, nullptr);
+
+            ShimLog(
+                "display: restoring %s to %lux%lu@%lu result=%ld",
+                g_display.deviceName,
+                g_display.original.dmPelsWidth,
+                g_display.original.dmPelsHeight,
+                g_display.original.dmDisplayFrequency,
+                result);
+        }
+
+        g_display = {};
+    }
+
+    bool CaptureDesktopMode(HWND hwnd)
+    {
+        MONITORINFOEXA monitor = {};
+        if (!GetMonitorDevice(hwnd, monitor))
             return false;
 
-        out = info.rcMonitor;
+        if (g_display.captured)
+        {
+            if (_stricmp(g_display.deviceName, monitor.szDevice) == 0)
+                return true;
+            RestoreDesktopMode();
+        }
+
+        DEVMODEA mode = {};
+        mode.dmSize = sizeof(mode);
+        if (!EnumDisplaySettingsExA(monitor.szDevice, ENUM_CURRENT_SETTINGS, &mode, 0))
+            return false;
+
+        g_display.captured = true;
+        g_display.changed = false;
+        strcpy_s(g_display.deviceName, monitor.szDevice);
+        g_display.original = mode;
+
+        ShimLog(
+            "display: captured %s desktop mode %lux%lu@%lu",
+            g_display.deviceName,
+            mode.dmPelsWidth,
+            mode.dmPelsHeight,
+            mode.dmDisplayFrequency);
         return true;
     }
 
-    // Where the logical image lands inside the borderless client area.
-    RECT ComputeDestRect(LONG clientW, LONG clientH)
+    // Put the monitor into `width x height`, or back to the desktop mode when
+    // that is already what was asked for. Returns true if the monitor now shows
+    // the requested geometry.
+    bool ApplyLegacyDisplayMode(HWND hwnd, UINT width, UINT height, UINT refresh)
     {
-        RECT dest = { 0, 0, clientW, clientH };
+        if (!hwnd || !width || !height)
+            return false;
 
-        if (g_scaling == Scaling::Stretch || g_logicalW <= 0 || g_logicalH <= 0)
-            return dest;
-
-        LONG width = clientW;
-        LONG height = clientH;
-
-        if (g_scaling == Scaling::Center)
+        if (!CaptureDesktopMode(hwnd))
         {
-            width = g_logicalW;
-            height = g_logicalH;
-        }
-        else
-        {
-            // Aspect: fit the logical aspect ratio inside the client area.
-            const long long byWidth = static_cast<long long>(clientW) * g_logicalH;
-            const long long byHeight = static_cast<long long>(clientH) * g_logicalW;
-
-            if (byWidth > byHeight)
-            {
-                height = clientH;
-                width = static_cast<LONG>(byHeight / g_logicalH);
-            }
-            else
-            {
-                width = clientW;
-                height = static_cast<LONG>(byWidth / g_logicalW);
-            }
+            ShimLog("display: failed to capture the current monitor mode");
+            return false;
         }
 
-        if (width > clientW)
-            width = clientW;
-        if (height > clientH)
-            height = clientH;
+        // A mission running at the desktop resolution needs no mode change, and
+        // if we changed it for the shell we have to undo that first.
+        if (g_display.original.dmPelsWidth == width && g_display.original.dmPelsHeight == height)
+        {
+            if (g_display.changed)
+            {
+                const LONG result = ChangeDisplaySettingsExA(
+                    g_display.deviceName, &g_display.original, nullptr, 0, nullptr);
+                g_display.changed = false;
+                ShimLog(
+                    "display: %ux%u is the desktop mode; restored %s result=%ld",
+                    width, height, g_display.deviceName, result);
+            }
+            return true;
+        }
 
-        dest.left = (clientW - width) / 2;
-        dest.top = (clientH - height) / 2;
-        dest.right = dest.left + width;
-        dest.bottom = dest.top + height;
-        return dest;
+        DEVMODEA current = {};
+        current.dmSize = sizeof(current);
+        if (!EnumDisplaySettingsExA(g_display.deviceName, ENUM_CURRENT_SETTINGS, &current, 0))
+            return false;
+
+        if (current.dmPelsWidth == width && current.dmPelsHeight == height)
+        {
+            g_display.changed = true;
+            return true;
+        }
+
+        DEVMODEA desired = current;
+        desired.dmSize = sizeof(desired);
+        desired.dmPelsWidth = width;
+        desired.dmPelsHeight = height;
+        desired.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+
+        if (refresh)
+        {
+            desired.dmDisplayFrequency = refresh;
+            desired.dmFields |= DM_DISPLAYFREQUENCY;
+        }
+
+        ShimLog(
+            "display: switching %s %lux%lu@%lu -> %ux%u@%u",
+            g_display.deviceName,
+            current.dmPelsWidth,
+            current.dmPelsHeight,
+            current.dmDisplayFrequency,
+            width,
+            height,
+            refresh);
+
+        LONG result = ChangeDisplaySettingsExA(
+            g_display.deviceName, &desired, nullptr, CDS_FULLSCREEN, nullptr);
+
+        if (result != DISP_CHANGE_SUCCESSFUL && refresh)
+        {
+            desired.dmFields &= ~DM_DISPLAYFREQUENCY;
+            result = ChangeDisplaySettingsExA(
+                g_display.deviceName, &desired, nullptr, CDS_FULLSCREEN, nullptr);
+            ShimLog("display: retried without an explicit refresh rate result=%ld", result);
+        }
+
+        if (result != DISP_CHANGE_SUCCESSFUL)
+        {
+            ShimLog("display: mode switch failed result=%ld", result);
+            return false;
+        }
+
+        g_display.changed = true;
+        return true;
     }
 
-    void PinBorderlessWindow(HWND hwnd)
+    // ---- window -------------------------------------------------------------
+
+    void PinWindow(HWND hwnd)
     {
         if (!hwnd || !IsWindow(hwnd) || !g_realSetWindowPos || !g_realSetWindowLongA)
             return;
@@ -354,8 +386,6 @@ namespace
         exStyle &= ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
         g_realSetWindowLongA(hwnd, GWL_EXSTYLE, exStyle);
 
-        // Black background so the pillarbox bars are not left showing whatever
-        // was on screen before. The game never paints outside its dest rect.
         SetClassLongPtrA(hwnd, GCLP_HBRBACKGROUND,
                          reinterpret_cast<LONG_PTR>(GetStockObject(BLACK_BRUSH)));
 
@@ -364,356 +394,127 @@ namespace
             HWND_TOP,
             g_windowRect.left,
             g_windowRect.top,
-            ClientWidth(),
-            ClientHeight(),
+            WindowWidth(),
+            WindowHeight(),
             SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
-
-        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
     }
 
-    // Rebuild every derived rectangle for a new logical size. Returns false if
-    // the monitor geometry could not be read, in which case we stay stock.
-    bool ActivateBorderless(HWND hwnd, UINT backBufferWidth, UINT backBufferHeight)
+    // Work out where a window of `width x height` should sit, after any display
+    // mode change has already been applied.
+    bool ComputeWindowRect(HWND hwnd, UINT width, UINT height, RECT& out)
     {
-        RECT monitor = {};
-        if (!GetMonitorRect(hwnd, monitor))
+        MONITORINFOEXA monitor = {};
+        if (!GetMonitorDevice(hwnd, monitor))
             return false;
 
-        g_gameWindow = hwnd;
-        g_windowRect = monitor;
-        g_logicalW = static_cast<LONG>(backBufferWidth);
-        g_logicalH = static_cast<LONG>(backBufferHeight);
+        const LONG monitorW = monitor.rcMonitor.right - monitor.rcMonitor.left;
+        const LONG monitorH = monitor.rcMonitor.bottom - monitor.rcMonitor.top;
 
-        const LONG clientW = ClientWidth();
-        const LONG clientH = ClientHeight();
-        if (clientW <= 0 || clientH <= 0 || g_logicalW <= 0 || g_logicalH <= 0)
-            return false;
-
-        g_destRect = ComputeDestRect(clientW, clientH);
-
-        const bool destIsWholeClient =
-            g_destRect.left == 0 && g_destRect.top == 0 &&
-            g_destRect.right == clientW && g_destRect.bottom == clientH;
-
-        g_needsPresentRect = !destIsWholeClient;
-        g_needsInputMapping = !(destIsWholeClient && g_logicalW == clientW && g_logicalH == clientH);
-
-        g_active = true;
-        g_presentLogBudget = 4;
-        PinBorderlessWindow(hwnd);
-
-        ShimLog(
-            "fullscreen: borderless %ldx%ld, logical %ldx%ld -> dest %ld,%ld %ldx%ld "
-            "(presentRect=%d inputMap=%d)",
-            clientW,
-            clientH,
-            g_logicalW,
-            g_logicalH,
-            g_destRect.left,
-            g_destRect.top,
-            g_destRect.right - g_destRect.left,
-            g_destRect.bottom - g_destRect.top,
-            g_needsPresentRect ? 1 : 0,
-            g_needsInputMapping ? 1 : 0);
-
+        // In displaymode the monitor should now match the requested size, so this
+        // lands at the origin and fills the screen. If the mode switch was
+        // refused it degrades to a centred window rather than a broken one.
+        out.left = monitor.rcMonitor.left + (monitorW - static_cast<LONG>(width)) / 2;
+        out.top = monitor.rcMonitor.top + (monitorH - static_cast<LONG>(height)) / 2;
+        if (out.left < monitor.rcMonitor.left)
+            out.left = monitor.rcMonitor.left;
+        if (out.top < monitor.rcMonitor.top)
+            out.top = monitor.rcMonitor.top;
+        out.right = out.left + static_cast<LONG>(width);
+        out.bottom = out.top + static_cast<LONG>(height);
         return true;
     }
 
-    void DeactivateBorderless(const char* reason)
+    void Deactivate(const char* reason)
     {
         if (!g_active)
             return;
 
         g_active = false;
-        g_needsPresentRect = false;
-        g_needsInputMapping = false;
-        ShimLog("fullscreen: borderless conversion disengaged (%s)", reason);
+        ShimLog("fullscreen: conversion disengaged (%s)", reason);
     }
 
-    // Rewrite an exclusive request into a borderless windowed one. Returns true
-    // when the conversion was applied and `converted` should be used instead.
-    bool ConvertExclusiveToBorderless(
+    // Rewrite an exclusive request into a windowed one on a borderless window of
+    // the same size. Returns true when `converted` should be used instead.
+    bool ConvertExclusiveRequest(
         HWND deviceWindow,
         const D3DPRESENT_PARAMETERS& requested,
         D3DPRESENT_PARAMETERS& converted)
     {
-        if (!g_enabled)
+        if (g_mode == Mode::Off)
             return false;
 
         if (requested.Windowed)
         {
-            // The player asked for a real window (Alt+Enter). Honour it and let
-            // the game restyle and resize its own window again.
-            DeactivateBorderless("game requested windowed mode");
+            // Alt+Enter: the player asked for a real window. Give the desktop
+            // back and let the game restyle and resize itself.
+            Deactivate("game requested windowed mode");
+            RestoreDesktopMode();
             return false;
         }
 
-        if (!ActivateBorderless(deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight))
+        if (!deviceWindow || !IsWindow(deviceWindow))
         {
-            ShimLog("fullscreen: could not resolve monitor geometry; leaving exclusive request stock");
+            ShimLog("fullscreen: no usable device window; leaving the request stock");
             return false;
         }
+
+        g_gameWindow = deviceWindow;
+
+        if (g_mode == Mode::DisplayMode)
+        {
+            ApplyLegacyDisplayMode(
+                deviceWindow,
+                requested.BackBufferWidth,
+                requested.BackBufferHeight,
+                requested.FullScreen_RefreshRateInHz);
+        }
+
+        if (!ComputeWindowRect(
+                deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight, g_windowRect))
+        {
+            ShimLog("fullscreen: could not resolve monitor geometry; leaving the request stock");
+            return false;
+        }
+
+        g_active = true;
+        PinWindow(deviceWindow);
 
         converted = requested;
         converted.Windowed = TRUE;
         converted.FullScreen_RefreshRateInHz = 0;
 
-        // A windowed swap chain may only take Present rectangles when it was
-        // created with D3DSWAPEFFECT_COPY, and COPY allows exactly one back
-        // buffer and no multisampling. Only pay that cost when pillarboxing.
-        if (g_needsPresentRect)
-        {
-            converted.SwapEffect = D3DSWAPEFFECT_COPY;
-            converted.BackBufferCount = 1;
-            converted.MultiSampleType = D3DMULTISAMPLE_NONE;
-            converted.MultiSampleQuality = 0;
-        }
+        ShimLog(
+            "fullscreen: exclusive %ux%u -> borderless window at %ld,%ld %ldx%ld",
+            requested.BackBufferWidth,
+            requested.BackBufferHeight,
+            g_windowRect.left,
+            g_windowRect.top,
+            WindowWidth(),
+            WindowHeight());
 
         return true;
     }
 
-    // Fall back from pillarbox to a plain full-client stretch. Used when the
-    // COPY swap chain is rejected, so the player still gets a working screen.
-    void DowngradeToStretch(D3DPRESENT_PARAMETERS& params, const D3DPRESENT_PARAMETERS& requested)
-    {
-        g_destRect = { 0, 0, ClientWidth(), ClientHeight() };
-        g_needsPresentRect = false;
-        g_needsInputMapping = !(g_logicalW == ClientWidth() && g_logicalH == ClientHeight());
-
-        params = requested;
-        params.Windowed = TRUE;
-        params.FullScreen_RefreshRateInHz = 0;
-
-        ShimLog("fullscreen: pillarbox swap chain rejected; falling back to full-client stretch");
-    }
-
-    // Report what the runtime actually granted, which is not always what was
-    // asked for, and how big the window really ended up.
-    void LogGrantedSwapChain(IDirect3DDevice9* device, const char* stage)
-    {
-        if (!device)
-            return;
-
-        IDirect3DSwapChain9* chain = nullptr;
-        if (FAILED(device->GetSwapChain(0, &chain)) || !chain)
-        {
-            ShimLog("fullscreen: [%s] could not read swap chain 0", stage);
-            return;
-        }
-
-        D3DPRESENT_PARAMETERS granted = {};
-        if (SUCCEEDED(chain->GetPresentParameters(&granted)))
-        {
-            ShimLog(
-                "fullscreen: [%s] granted %ux%u fmt=%u count=%u swapEffect=%u windowed=%d "
-                "flags=0x%08lX hDeviceWindow=%p",
-                stage,
-                granted.BackBufferWidth,
-                granted.BackBufferHeight,
-                static_cast<unsigned>(granted.BackBufferFormat),
-                granted.BackBufferCount,
-                static_cast<unsigned>(granted.SwapEffect),
-                granted.Windowed ? 1 : 0,
-                granted.Flags,
-                granted.hDeviceWindow);
-        }
-        chain->Release();
-
-        if (g_gameWindow && g_realGetClientRect)
-        {
-            RECT client = {};
-            g_realGetClientRect(g_gameWindow, &client);
-            RECT window = {};
-            GetWindowRect(g_gameWindow, &window);
-            ShimLog(
-                "fullscreen: [%s] real client %ldx%ld, window %ld,%ld %ldx%ld, style=0x%08lX",
-                stage,
-                client.right - client.left,
-                client.bottom - client.top,
-                window.left,
-                window.top,
-                window.right - window.left,
-                window.bottom - window.top,
-                GetWindowLongA(g_gameWindow, GWL_STYLE));
-        }
-    }
-
-    // Upscale by pulling the back buffer's DC and StretchBlt-ing it into the
-    // window. The shell back buffer is created with LOCKABLE_BACKBUFFER (the
-    // game needs that for its own GDI painting), so GetDC is always available
-    // here, and 640x480 -> 2880x2160 once per shell frame is cheap.
-    bool PresentViaGdiStretch(IDirect3DDevice9* device)
+    void LogGranted(IDirect3DDevice9* device, const char* stage)
     {
         if (!device || !g_gameWindow)
-            return false;
-
-        const LONG destW = g_destRect.right - g_destRect.left;
-        const LONG destH = g_destRect.bottom - g_destRect.top;
-        if (destW <= 0 || destH <= 0)
-            return false;
-
-        IDirect3DSurface9* back = nullptr;
-        if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back)
-            return false;
-
-        bool blitted = false;
-        HDC source = nullptr;
-        const HRESULT hr = back->GetDC(&source);
-        if (SUCCEEDED(hr) && source)
-        {
-            HDC target = GetDC(g_gameWindow);
-            if (target)
-            {
-                SetStretchBltMode(target, COLORONCOLOR);
-                blitted = StretchBlt(
-                              target,
-                              g_destRect.left,
-                              g_destRect.top,
-                              destW,
-                              destH,
-                              source,
-                              0,
-                              0,
-                              g_logicalW,
-                              g_logicalH,
-                              SRCCOPY) != FALSE;
-                ReleaseDC(g_gameWindow, target);
-            }
-            back->ReleaseDC(source);
-        }
-        else if (g_presentLogBudget > 0)
-        {
-            --g_presentLogBudget;
-            ShimLog("fullscreen: back buffer GetDC failed hr=0x%08lX; GDI upscale unavailable", hr);
-        }
-
-        back->Release();
-        return blitted;
-    }
-
-    // Sample the same 3x3 grid of logical coordinates out of the back buffer and
-    // out of the window client area. Present is being called with a destination
-    // rect the runtime says it honours, yet the shell lands unscaled at the
-    // client origin, so we need to know which surface the shell actually painted.
-    void SampleGrid(HDC dc, char (&out)[192])
-    {
-        out[0] = '\0';
-        for (int row = 0; row < 3; ++row)
-        {
-            for (int col = 0; col < 3; ++col)
-            {
-                const int x = static_cast<int>((g_logicalW * (2 * col + 1)) / 6);
-                const int y = static_cast<int>((g_logicalH * (2 * row + 1)) / 6);
-                const COLORREF pixel = GetPixel(dc, x, y);
-
-                char one[24] = {};
-                if (pixel == CLR_INVALID)
-                    strcpy_s(one, "------ ");
-                else
-                    _snprintf_s(one, sizeof(one), _TRUNCATE, "%06lX ",
-                                static_cast<unsigned long>(pixel & 0x00FFFFFF));
-                strcat_s(out, one);
-            }
-        }
-    }
-
-    void ProbeSurfaces(IDirect3DDevice9* device)
-    {
-        if (!device || !g_gameWindow || g_logicalW <= 0 || g_logicalH <= 0)
             return;
 
-        char grid[192] = {};
+        RECT client = {};
+        GetClientRect(g_gameWindow, &client);
+        RECT window = {};
+        GetWindowRect(g_gameWindow, &window);
 
-        IDirect3DSurface9* back = nullptr;
-        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) && back)
-        {
-            HDC backDc = nullptr;
-            const HRESULT hr = back->GetDC(&backDc);
-            if (SUCCEEDED(hr) && backDc)
-            {
-                SampleGrid(backDc, grid);
-                ShimLog("probe: back buffer  %s", grid);
-                back->ReleaseDC(backDc);
-            }
-            else
-            {
-                ShimLog("probe: back buffer GetDC failed hr=0x%08lX", hr);
-            }
-            back->Release();
-        }
-        else
-        {
-            ShimLog("probe: GetBackBuffer failed");
-        }
-
-        HDC windowDc = GetDC(g_gameWindow);
-        if (windowDc)
-        {
-            SampleGrid(windowDc, grid);
-            ShimLog("probe: window client %s", grid);
-            ReleaseDC(g_gameWindow, windowDc);
-        }
-    }
-
-    HRESULT STDMETHODCALLTYPE HookPresent(
-        IDirect3DDevice9* device,
-        const RECT* sourceRect,
-        const RECT* destRect,
-        HWND destWindowOverride,
-        const RGNDATA* dirtyRegion)
-    {
-        const bool scaling = g_active && g_needsPresentRect && !sourceRect && !destRect;
-
-        ++g_presentCount;
-        if (g_presentCount % 200 == 0)
-            ShimLog("fullscreen: %ld Present calls so far", g_presentCount);
-
-        if (g_presentLogBudget > 0)
-        {
-            --g_presentLogBudget;
-            ShimLog(
-                "fullscreen: Present active=%d needsRect=%d srcRect=%p dstRect=%p override=%p "
-                "-> scaling=%d blit=%d dest=%ld,%ld %ldx%ld",
-                g_active ? 1 : 0,
-                g_needsPresentRect ? 1 : 0,
-                sourceRect,
-                destRect,
-                destWindowOverride,
-                scaling ? 1 : 0,
-                static_cast<int>(g_blit),
-                g_destRect.left,
-                g_destRect.top,
-                g_destRect.right - g_destRect.left,
-                g_destRect.bottom - g_destRect.top);
-
-            ProbeSurfaces(device);
-
-            if (g_presentLogBudget == 0)
-                LogGrantedSwapChain(device, "present");
-        }
-
-        if (scaling && g_blit == Blit::Gdi)
-        {
-            if (PresentViaGdiStretch(device))
-                return D3D_OK;
-            // Fall through and let the runtime try, so a frame is never dropped.
-        }
-
-        const HRESULT hr = g_realPresent(
-            device, sourceRect, scaling ? &g_destRect : destRect, destWindowOverride, dirtyRegion);
-
-        if (scaling && FAILED(hr) && g_blit == Blit::Auto)
-        {
-            ShimLog(
-                "fullscreen: Present rejected the destination rect hr=0x%08lX; "
-                "switching to GDI upscale for the rest of this session",
-                hr);
-            g_blit = Blit::Gdi;
-            if (PresentViaGdiStretch(device))
-                return D3D_OK;
-        }
-
-        return hr;
+        ShimLog(
+            "fullscreen: [%s] client %ldx%ld, window %ld,%ld %ldx%ld, style=0x%08lX",
+            stage,
+            client.right - client.left,
+            client.bottom - client.top,
+            window.left,
+            window.top,
+            window.right - window.left,
+            window.bottom - window.top,
+            GetWindowLongA(g_gameWindow, GWL_STYLE));
     }
 
     HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params)
@@ -725,34 +526,34 @@ namespace
             return g_realReset(device, params);
 
         const D3DPRESENT_PARAMETERS requested = *params;
-        HWND deviceWindow = ResolveDeviceWindow(device, params);
+        HWND deviceWindow = params->hDeviceWindow ? params->hDeviceWindow : g_gameWindow;
 
         D3DPRESENT_PARAMETERS converted = {};
-        if (!ConvertExclusiveToBorderless(deviceWindow, requested, converted))
+        if (!ConvertExclusiveRequest(deviceWindow, requested, converted))
             return g_realReset(device, params);
 
         HRESULT hr = g_realReset(device, &converted);
 
-        if (FAILED(hr) && g_needsPresentRect)
-        {
-            D3DPRESENT_PARAMETERS stretched = {};
-            DowngradeToStretch(stretched, requested);
-            hr = g_realReset(device, &stretched);
-            if (SUCCEEDED(hr))
-                PinBorderlessWindow(deviceWindow);
-        }
-
         if (FAILED(hr))
         {
-            ShimLog("fullscreen: borderless Reset failed hr=0x%08lX; retrying the stock request", hr);
-            DeactivateBorderless("borderless Reset failed");
-            return g_realReset(device, params);
+            // A mode switch is still settling often enough to be worth one retry
+            // before giving up and handing the game its original request back.
+            Sleep(120);
+            hr = g_realReset(device, &converted);
+            if (FAILED(hr))
+            {
+                ShimLog("fullscreen: windowed Reset failed hr=0x%08lX; retrying the stock request", hr);
+                Deactivate("windowed Reset failed");
+                RestoreDesktopMode();
+                return g_realReset(device, params);
+            }
+            ShimLog("fullscreen: windowed Reset succeeded on retry");
         }
 
-        // The game reapplies its own window style and size right after this
-        // returns, so re-pin once the device is back.
-        PinBorderlessWindow(deviceWindow);
-        LogGrantedSwapChain(device, "reset");
+        // D3D_Change_Mode_Ex reapplies its own window style and size right after
+        // this returns, so pin the layout again once the device is back.
+        PinWindow(deviceWindow);
+        LogGranted(device, "reset");
         return hr;
     }
 
@@ -762,26 +563,14 @@ namespace
             return;
 
         void** vtable = *reinterpret_cast<void***>(device);
-
-        void* originalReset = reinterpret_cast<void*>(g_realReset);
+        void* original = reinterpret_cast<void*>(g_realReset);
         if (PatchPointer(&vtable[kIDirect3DDevice9ResetIndex],
-                         reinterpret_cast<void*>(&HookReset), &originalReset))
+                         reinterpret_cast<void*>(&HookReset), &original))
         {
             if (!g_realReset)
             {
-                g_realReset = reinterpret_cast<ResetFn>(originalReset);
+                g_realReset = reinterpret_cast<ResetFn>(original);
                 ShimLog("fullscreen: IDirect3DDevice9::Reset hook installed");
-            }
-        }
-
-        void* originalPresent = reinterpret_cast<void*>(g_realPresent);
-        if (PatchPointer(&vtable[kIDirect3DDevice9PresentIndex],
-                         reinterpret_cast<void*>(&HookPresent), &originalPresent))
-        {
-            if (!g_realPresent)
-            {
-                g_realPresent = reinterpret_cast<PresentFn>(originalPresent);
-                ShimLog("fullscreen: IDirect3DDevice9::Present hook installed");
             }
         }
     }
@@ -808,24 +597,17 @@ namespace
         HWND deviceWindow = params->hDeviceWindow ? params->hDeviceWindow : focusWindow;
 
         D3DPRESENT_PARAMETERS converted = {};
-        const bool wasExclusive = ConvertExclusiveToBorderless(deviceWindow, requested, converted);
+        const bool converting = ConvertExclusiveRequest(deviceWindow, requested, converted);
 
         HRESULT hr = g_realCreateDevice(
             d3d, adapter, deviceType, focusWindow, behaviorFlags,
-            wasExclusive ? &converted : params, outDevice);
+            converting ? &converted : params, outDevice);
 
-        if (FAILED(hr) && wasExclusive && g_needsPresentRect)
+        if (FAILED(hr) && converting)
         {
-            D3DPRESENT_PARAMETERS stretched = {};
-            DowngradeToStretch(stretched, requested);
-            hr = g_realCreateDevice(
-                d3d, adapter, deviceType, focusWindow, behaviorFlags, &stretched, outDevice);
-        }
-
-        if (FAILED(hr) && wasExclusive)
-        {
-            ShimLog("fullscreen: borderless CreateDevice failed hr=0x%08lX; retrying the stock request", hr);
-            DeactivateBorderless("borderless CreateDevice failed");
+            ShimLog("fullscreen: windowed CreateDevice failed hr=0x%08lX; retrying the stock request", hr);
+            Deactivate("windowed CreateDevice failed");
+            RestoreDesktopMode();
             hr = g_realCreateDevice(
                 d3d, adapter, deviceType, focusWindow, behaviorFlags, params, outDevice);
         }
@@ -835,8 +617,8 @@ namespace
             HookDeviceMethods(*outDevice);
             if (g_active)
             {
-                PinBorderlessWindow(deviceWindow);
-                LogGrantedSwapChain(*outDevice, "create");
+                PinWindow(deviceWindow);
+                LogGranted(*outDevice, "create");
             }
         }
 
@@ -873,7 +655,7 @@ namespace
         return d3d;
     }
 
-    // ---- window pinning -----------------------------------------------------
+    // ---- keeping the game from restyling its own window ---------------------
 
     bool OwnsWindow(HWND hwnd)
     {
@@ -887,8 +669,8 @@ namespace
         {
             x = g_windowRect.left;
             y = g_windowRect.top;
-            cx = ClientWidth();
-            cy = ClientHeight();
+            cx = WindowWidth();
+            cy = WindowHeight();
             flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
         }
 
@@ -921,138 +703,34 @@ namespace
         {
             x = g_windowRect.left;
             y = g_windowRect.top;
-            width = ClientWidth();
-            height = ClientHeight();
+            width = WindowWidth();
+            height = WindowHeight();
         }
 
         return g_realMoveWindow(hwnd, x, y, width, height, repaint);
     }
 
-    // ---- coordinate space ---------------------------------------------------
-
-    LONG ClampTo(LONG value, LONG limit)
-    {
-        if (value < 0)
-            return 0;
-        if (value > limit - 1)
-            return limit - 1;
-        return value;
-    }
-
-    void ActualToLogical(LONG& x, LONG& y)
-    {
-        const LONG destW = g_destRect.right - g_destRect.left;
-        const LONG destH = g_destRect.bottom - g_destRect.top;
-        if (destW <= 0 || destH <= 0)
-            return;
-
-        x = ClampTo(static_cast<LONG>((static_cast<long long>(x - g_destRect.left) * g_logicalW) / destW),
-                    g_logicalW);
-        y = ClampTo(static_cast<LONG>((static_cast<long long>(y - g_destRect.top) * g_logicalH) / destH),
-                    g_logicalH);
-    }
-
-    void LogicalToActual(LONG& x, LONG& y)
-    {
-        const LONG destW = g_destRect.right - g_destRect.left;
-        const LONG destH = g_destRect.bottom - g_destRect.top;
-        if (destW <= 0 || destH <= 0 || g_logicalW <= 0 || g_logicalH <= 0)
-            return;
-
-        x = g_destRect.left + static_cast<LONG>((static_cast<long long>(x) * destW) / g_logicalW);
-        y = g_destRect.top + static_cast<LONG>((static_cast<long long>(y) * destH) / g_logicalH);
-    }
-
-    // The game sizes its viewport, its mouse clip rect and its shell hit testing
-    // from this, so it has to keep seeing the logical mode size.
-    BOOL WINAPI HookGetClientRect(HWND hwnd, LPRECT rect)
-    {
-        if (OwnsWindow(hwnd) && g_needsInputMapping && rect)
-        {
-            rect->left = 0;
-            rect->top = 0;
-            rect->right = g_logicalW;
-            rect->bottom = g_logicalH;
-            return TRUE;
-        }
-
-        return g_realGetClientRect(hwnd, rect);
-    }
-
-    // GetWindowScreenCoordinates and LockMouse feed logical coordinates through
-    // here to build the ClipCursor rect and to recentre the cursor.
-    BOOL WINAPI HookClientToScreen(HWND hwnd, LPPOINT point)
-    {
-        if (OwnsWindow(hwnd) && g_needsInputMapping && point)
-            LogicalToActual(point->x, point->y);
-
-        return g_realClientToScreen(hwnd, point);
-    }
-
-    bool IsPositionalMouseMessage(UINT message)
-    {
-        // WM_MOUSEMOVE .. WM_MBUTTONDBLCLK carry client coordinates in lParam.
-        // WM_MOUSEWHEEL/WM_XBUTTON*/WM_MOUSEHWHEEL carry screen coordinates and
-        // the game only reads their wParam, so they are left alone.
-        return message >= WM_MOUSEMOVE && message <= WM_MBUTTONDBLCLK;
-    }
-
-    void RemapMouseMessage(MSG* msg)
-    {
-        if (!msg || !g_active || !g_needsInputMapping)
-            return;
-        if (msg->hwnd != g_gameWindow || !IsPositionalMouseMessage(msg->message))
-            return;
-
-        LONG x = GET_X_LPARAM(msg->lParam);
-        LONG y = GET_Y_LPARAM(msg->lParam);
-        ActualToLogical(x, y);
-        msg->lParam = MAKELPARAM(static_cast<WORD>(x), static_cast<WORD>(y));
-    }
-
-    BOOL WINAPI HookGetMessageA(LPMSG msg, HWND hwnd, UINT filterMin, UINT filterMax)
-    {
-        const BOOL result = g_realGetMessageA(msg, hwnd, filterMin, filterMax);
-        if (result > 0)
-            RemapMouseMessage(msg);
-        return result;
-    }
-
-    BOOL WINAPI HookPeekMessageA(
-        LPMSG msg, HWND hwnd, UINT filterMin, UINT filterMax, UINT removeFlags)
-    {
-        const BOOL result = g_realPeekMessageA(msg, hwnd, filterMin, filterMax, removeFlags);
-        if (result)
-            RemapMouseMessage(msg);
-        return result;
-    }
-
     struct ImportHook
     {
-        const char* dll;
         const char* name;
         void* replacement;
         void** original;
         bool required;
     };
 
-    bool InstallWindowAndInputHooks(HMODULE exe)
+    bool InstallWindowHooks(HMODULE exe)
     {
         const ImportHook hooks[] = {
-            { "user32.dll", "SetWindowPos",   &HookSetWindowPos,   reinterpret_cast<void**>(&g_realSetWindowPos),   true },
-            { "user32.dll", "SetWindowLongA", &HookSetWindowLongA, reinterpret_cast<void**>(&g_realSetWindowLongA), true },
-            { "user32.dll", "MoveWindow",     &HookMoveWindow,     reinterpret_cast<void**>(&g_realMoveWindow),     false },
-            { "user32.dll", "GetClientRect",  &HookGetClientRect,  reinterpret_cast<void**>(&g_realGetClientRect),  true },
-            { "user32.dll", "ClientToScreen", &HookClientToScreen, reinterpret_cast<void**>(&g_realClientToScreen), true },
-            { "user32.dll", "GetMessageA",    &HookGetMessageA,    reinterpret_cast<void**>(&g_realGetMessageA),    true },
-            { "user32.dll", "PeekMessageA",   &HookPeekMessageA,   reinterpret_cast<void**>(&g_realPeekMessageA),   true },
+            { "SetWindowPos",   &HookSetWindowPos,   reinterpret_cast<void**>(&g_realSetWindowPos),   true },
+            { "SetWindowLongA", &HookSetWindowLongA, reinterpret_cast<void**>(&g_realSetWindowLongA), true },
+            { "MoveWindow",     &HookMoveWindow,     reinterpret_cast<void**>(&g_realMoveWindow),     false },
         };
 
-        bool allRequired = true;
+        bool ok = true;
         for (const ImportHook& hook : hooks)
         {
             void* original = nullptr;
-            if (HookImport(exe, hook.dll, hook.name, hook.replacement, &original) && original)
+            if (HookImport(exe, "user32.dll", hook.name, hook.replacement, &original) && original)
             {
                 *hook.original = original;
                 continue;
@@ -1060,17 +738,17 @@ namespace
 
             ShimLog("fullscreen: %s import hook unavailable", hook.name);
             if (hook.required)
-                allRequired = false;
+                ok = false;
         }
 
-        return allRequired;
+        return ok;
     }
 }
 
 bool InstallFullscreenMenuFix()
 {
     LoadSettings();
-    if (!g_enabled)
+    if (g_mode == Mode::Off)
     {
         ShimLog("fullscreen: disabled by bz15_shim.ini; leaving the game stock");
         return false;
@@ -1078,9 +756,9 @@ bool InstallFullscreenMenuFix()
 
     HMODULE exe = GetModuleHandleA(nullptr);
 
-    if (!InstallWindowAndInputHooks(exe))
+    if (!InstallWindowHooks(exe))
     {
-        ShimLog("fullscreen: required window/input hooks missing; refusing to convert fullscreen");
+        ShimLog("fullscreen: required window hooks missing; refusing to convert fullscreen");
         return false;
     }
 
@@ -1099,7 +777,6 @@ bool InstallFullscreenMenuFix()
 
 void ShutdownFullscreenMenuFix()
 {
-    // Nothing to undo: this path never changes the desktop display mode, and the
-    // process is going away with its window.
-    DeactivateBorderless("shutdown");
+    Deactivate("shutdown");
+    RestoreDesktopMode();
 }
