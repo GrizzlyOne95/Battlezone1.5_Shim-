@@ -95,6 +95,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
+        ShutdownFullscreenMenuFix();
         FreeRealWinmm();
         break;
     }
