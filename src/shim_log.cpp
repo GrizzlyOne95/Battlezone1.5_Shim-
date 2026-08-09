@@ -36,7 +36,7 @@ void ShimLog(const char* format, ...)
     char message[2048] = {};
     va_list args;
     va_start(args, format);
-    _vsnprintf_s(message, _countof(message), _TRUNCATE, format, args);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
     va_end(args);
 
     SYSTEMTIME st = {};
@@ -45,7 +45,7 @@ void ShimLog(const char* format, ...)
     char line[2300] = {};
     _snprintf_s(
         line,
-        _countof(line),
+        sizeof(line),
         _TRUNCATE,
         "[%04u-%02u-%02u %02u:%02u:%02u.%03u] %s\r\n",
         st.wYear,
