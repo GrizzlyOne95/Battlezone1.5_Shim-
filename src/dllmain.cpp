@@ -1,5 +1,6 @@
 #include "fullscreen_fix.h"
 #include "movie_fix.h"
+#include "movie_paint_fix.h"
 #include "shim_log.h"
 #include "winmm_proxy.h"
 
@@ -93,6 +94,15 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
                 ShimLog("startup: legacy movie compatibility hook active");
             else
                 ShimLog("startup: legacy movie hook could not be installed");
+
+            // Install this after the IV50 compatibility hook so the IAT chain is:
+            // bzone -> software repaint -> IV50 fallback -> WinMM proxy -> system.
+            // That lets the repaint layer see the real device ID returned by a
+            // successful cached retry as well as natively supported movies.
+            if (InstallLegacyMoviePaintFix())
+                ShimLog("startup: legacy movie software repaint hook active");
+            else
+                ShimLog("startup: legacy movie software repaint hook could not be installed");
         }
         else
         {
@@ -101,6 +111,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
+        ShutdownLegacyMoviePaintFix();
         ShutdownLegacyMovieFix();
         ShutdownFullscreenMenuFix();
         FreeRealWinmm();
