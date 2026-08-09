@@ -27,6 +27,7 @@ namespace
     bool g_borderlessPresentationActive = false;
     HWND g_borderlessWindow = nullptr;
     bool g_loggedPresentScaling = false;
+    bool g_loggedPresentFailure = false;
 
     bool PatchPointer(void** slot, void* replacement, void** original)
     {
@@ -107,17 +108,19 @@ namespace
         converted.Windowed = TRUE;
         converted.FullScreen_RefreshRateInHz = 0;
 
-        // Preserve the game's logical backbuffer dimensions. Battlezone's shell
-        // is built around legacy modes such as 640x480; the Present hook below
-        // scales that backbuffer to the desktop-sized borderless client area.
-        if (converted.SwapEffect == D3DSWAPEFFECT_FLIP)
-            converted.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        // Preserve Battlezone's logical backbuffer dimensions, but use COPY so
+        // D3D9 legally permits source/destination rectangles during Present.
+        // COPY requires exactly one backbuffer and does not support MSAA.
+        converted.SwapEffect = D3DSWAPEFFECT_COPY;
+        converted.BackBufferCount = 1;
+        converted.MultiSampleType = D3DMULTISAMPLE_NONE;
+        converted.MultiSampleQuality = 0;
 
         HWND deviceWindow = converted.hDeviceWindow ? converted.hDeviceWindow : focusWindow;
         MakeWindowBorderless(deviceWindow);
 
         ShimLog(
-            "fullscreen: converting exclusive request %ux%u fmt=%u refresh=%u -> borderless windowed",
+            "fullscreen: converting exclusive request %ux%u fmt=%u refresh=%u -> borderless windowed COPY",
             requested.BackBufferWidth,
             requested.BackBufferHeight,
             static_cast<unsigned>(requested.BackBufferFormat),
@@ -131,6 +134,7 @@ namespace
         g_borderlessPresentationActive = active;
         g_borderlessWindow = active ? hwnd : nullptr;
         g_loggedPresentScaling = false;
+        g_loggedPresentFailure = false;
     }
 
     HRESULT STDMETHODCALLTYPE HookPresent(
@@ -184,7 +188,13 @@ namespace
             g_loggedPresentScaling = true;
         }
 
-        return g_realPresent(device, sourceRect, &clientRect, destWindowOverride, dirtyRegion);
+        HRESULT hr = g_realPresent(device, sourceRect, &clientRect, destWindowOverride, dirtyRegion);
+        if (FAILED(hr) && !g_loggedPresentFailure)
+        {
+            ShimLog("fullscreen: scaled Present failed hr=0x%08lX", hr);
+            g_loggedPresentFailure = true;
+        }
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE HookReset(
