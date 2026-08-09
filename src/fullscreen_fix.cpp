@@ -88,7 +88,17 @@ namespace
         Off,
     };
 
+    enum class MirrorAspect
+    {
+        // Fill the screen. The 4:3 shell is stretched to 16:9, but this is the
+        // configuration that is known to render at full size.
+        Stretch,
+        // Pillarbox to keep the shell's 4:3 proportions.
+        Fit,
+    };
+
     Mode g_mode = Mode::DisplayMode;
+    MirrorAspect g_mirrorAspect = MirrorAspect::Stretch;
 
     bool g_active = false;
     HWND g_gameWindow = nullptr;
@@ -147,7 +157,11 @@ namespace
         else
             g_mode = Mode::DisplayMode;
 
-        ShimLog("fullscreen: settings mode=%s (%s)", mode, ini);
+        char aspect[32] = {};
+        GetPrivateProfileStringA("Fullscreen", "MirrorAspect", "stretch", aspect, sizeof(aspect), ini);
+        g_mirrorAspect = (_stricmp(aspect, "fit") == 0) ? MirrorAspect::Fit : MirrorAspect::Stretch;
+
+        ShimLog("fullscreen: settings mode=%s mirrorAspect=%s (%s)", mode, aspect, ini);
     }
 
     bool PatchPointer(void** slot, void* replacement, void** original)
@@ -689,21 +703,22 @@ namespace
         g_mirrorSourceW = sourceSize.cx;
         g_mirrorSourceH = sourceSize.cy;
 
-        // Hand DWM the whole client area and let it do its own aspect fit. A
-        // hand-computed 4:3 sub-rectangle of a 4:3 client came back rendered at
-        // roughly 1680x2160 instead of 2880x2160, which no aspect fit of a
-        // 640x480 source can produce, so our rectangle was not being used the
-        // way the documentation implies. This removes it from the equation.
-        g_mirrorDest = AspectFit(
-            sourceSize.cx,
-            sourceSize.cy,
-            hostClient.right - hostClient.left,
-            hostClient.bottom - hostClient.top);
+        // DWM stretches the source to fill rcDestination. Whatever rectangle we
+        // hand it is therefore also exactly where the image lands, so the mouse
+        // mapping must be derived from the same rectangle -- not from a
+        // separately computed one, which is how clicks ended up drifting.
+        g_mirrorDest = (g_mirrorAspect == MirrorAspect::Fit)
+            ? AspectFit(
+                  sourceSize.cx,
+                  sourceSize.cy,
+                  hostClient.right - hostClient.left,
+                  hostClient.bottom - hostClient.top)
+            : hostClient;
 
         DWM_THUMBNAIL_PROPERTIES properties = {};
         properties.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE |
                              DWM_TNP_SOURCECLIENTAREAONLY | DWM_TNP_OPACITY;
-        properties.rcDestination = hostClient;
+        properties.rcDestination = g_mirrorDest;
         properties.fVisible = TRUE;
         properties.fSourceClientAreaOnly = TRUE;
         properties.opacity = 255;
