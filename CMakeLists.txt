@@ -23,7 +23,7 @@ add_library(winmm SHARED
 target_compile_features(winmm PRIVATE cxx_std_17)
 target_compile_definitions(winmm PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_include_directories(winmm PRIVATE src)
-target_link_libraries(winmm PRIVATE version dwmapi)
+target_link_libraries(winmm PRIVATE version dwmapi vfw32)
 
 set_target_properties(winmm PROPERTIES
     OUTPUT_NAME "winmm"
