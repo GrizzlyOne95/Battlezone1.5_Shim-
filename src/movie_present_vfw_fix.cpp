@@ -5,6 +5,7 @@
 #include <mmsystem.h>
 #include <digitalv.h>
 #include <vfw.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -53,9 +54,6 @@ namespace
         UINT_PTR timerId = 0;
         std::string effectivePath;
 
-        // Scratch surface used only to ask MCIAVI whether it can actually supply
-        // pixels for this device. A successful all-black update is the signal to
-        // switch the device to direct VfW frame extraction.
         HDC memoryDc = nullptr;
         HBITMAP dib = nullptr;
         HGDIOBJ oldBitmap = nullptr;
@@ -279,7 +277,7 @@ namespace
     bool LoadVfw()
     {
         if (g_avifil32)
-            return true;
+            return g_aviInitialized;
 
         g_avifil32 = LoadLibraryA("avifil32.dll");
         if (!g_avifil32)
@@ -288,18 +286,28 @@ namespace
             return false;
         }
 
-#define RESOLVE_VFW(name) \
-        g_##name = reinterpret_cast<name##Fn>(GetProcAddress(g_avifil32, #name)); \
-        if (!g_##name) { ShimLog("movievfw: missing avifil32 export %s", #name); return false; }
+        g_aviFileInit = reinterpret_cast<AVIFileInitFn>(GetProcAddress(g_avifil32, "AVIFileInit"));
+        g_aviFileExit = reinterpret_cast<AVIFileExitFn>(GetProcAddress(g_avifil32, "AVIFileExit"));
+        g_aviStreamOpenFromFileA = reinterpret_cast<AVIStreamOpenFromFileAFn>(
+            GetProcAddress(g_avifil32, "AVIStreamOpenFromFileA"));
+        g_aviStreamGetFrameOpen = reinterpret_cast<AVIStreamGetFrameOpenFn>(
+            GetProcAddress(g_avifil32, "AVIStreamGetFrameOpen"));
+        g_aviStreamGetFrame = reinterpret_cast<AVIStreamGetFrameFn>(
+            GetProcAddress(g_avifil32, "AVIStreamGetFrame"));
+        g_aviStreamGetFrameClose = reinterpret_cast<AVIStreamGetFrameCloseFn>(
+            GetProcAddress(g_avifil32, "AVIStreamGetFrameClose"));
+        g_aviStreamTimeToSample = reinterpret_cast<AVIStreamTimeToSampleFn>(
+            GetProcAddress(g_avifil32, "AVIStreamTimeToSample"));
 
-        RESOLVE_VFW(aviFileInit);
-        RESOLVE_VFW(aviFileExit);
-        RESOLVE_VFW(aviStreamOpenFromFileA);
-        RESOLVE_VFW(aviStreamGetFrameOpen);
-        RESOLVE_VFW(aviStreamGetFrame);
-        RESOLVE_VFW(aviStreamGetFrameClose);
-        RESOLVE_VFW(aviStreamTimeToSample);
-#undef RESOLVE_VFW
+        if (!g_aviFileInit || !g_aviFileExit || !g_aviStreamOpenFromFileA ||
+            !g_aviStreamGetFrameOpen || !g_aviStreamGetFrame ||
+            !g_aviStreamGetFrameClose || !g_aviStreamTimeToSample)
+        {
+            ShimLog("movievfw: required Avifil32 exports are unavailable");
+            FreeLibrary(g_avifil32);
+            g_avifil32 = nullptr;
+            return false;
+        }
 
         g_aviFileInit();
         g_aviInitialized = true;
@@ -433,10 +441,12 @@ namespace
         if (!slot.bits || !slot.haveDestination || slot.surfaceW <= 0 || slot.surfaceH <= 0)
             return false;
 
-        const int x0 = max(0, static_cast<int>(slot.destination.left));
-        const int y0 = max(0, static_cast<int>(slot.destination.top));
-        const int x1 = min(slot.surfaceW, x0 + max(0, static_cast<int>(slot.destination.right)));
-        const int y1 = min(slot.surfaceH, y0 + max(0, static_cast<int>(slot.destination.bottom)));
+        const int x0 = std::max(0, static_cast<int>(slot.destination.left));
+        const int y0 = std::max(0, static_cast<int>(slot.destination.top));
+        const int x1 = std::min(slot.surfaceW,
+                                x0 + std::max(0, static_cast<int>(slot.destination.right)));
+        const int y1 = std::min(slot.surfaceH,
+                                y0 + std::max(0, static_cast<int>(slot.destination.bottom)));
         if (x1 <= x0 || y1 <= y0)
             return false;
 
@@ -500,10 +510,7 @@ namespace
             MCI_UPDATE,
             MCI_DGV_UPDATE_HDC | MCI_DGV_UPDATE_PAINT,
             reinterpret_cast<DWORD_PTR>(&update));
-        if (updateResult != 0)
-            return false;
-
-        if (!DestinationHasPixels(slot))
+        if (updateResult != 0 || !DestinationHasPixels(slot))
             return false;
 
         HWND paintWindow = FindVisibleAncestor(slot.mciWindow);
@@ -545,7 +552,7 @@ namespace
         if (slot.vfwFailed || slot.effectivePath.empty() || !LoadVfw())
             return false;
 
-        HRESULT hr = g_aviStreamOpenFromFileA(
+        const HRESULT hr = g_aviStreamOpenFromFileA(
             &slot.stream,
             slot.effectivePath.c_str(),
             streamtypeVIDEO,
@@ -605,9 +612,6 @@ namespace
         if (slot.timeFormatKnown && slot.timeFormat == MCI_FORMAT_FRAMES)
             return position;
 
-        // MCIAVI normally reports milliseconds unless explicitly changed to
-        // frames. AVIStreamTimeToSample gives the exact corresponding video
-        // sample for the stream rate, so 15/29.97/etc. are handled correctly.
         if (!slot.timeFormatKnown || slot.timeFormat == MCI_FORMAT_MILLISECONDS)
             return g_aviStreamTimeToSample(slot.stream, position);
 
