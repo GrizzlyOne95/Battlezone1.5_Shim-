@@ -1,7 +1,7 @@
 #include "fullscreen_fix.h"
 #include "movie_fix.h"
 #include "movie_geometry_probe.h"
-#include "movie_present_fix.h"
+#include "movie_present_vfw_fix.h"
 #include "shim_log.h"
 #include "winmm_proxy.h"
 
@@ -96,21 +96,21 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
             else
                 ShimLog("startup: legacy movie hook could not be installed");
 
-            // Keep this passive probe below the codec fallback so it sees the
-            // final device ID and the game's real WINDOW/PUT geometry.
             if (InstallMovieGeometryProbe())
                 ShimLog("startup: passive movie geometry probe active");
             else
                 ShimLog("startup: passive movie geometry probe could not be installed");
 
-            // Install outermost. It never shows/resizes/reparents the hidden MCI
-            // target. Playback is sampled only later from a timer into an
-            // off-screen DIB, then the known MCI_PUT region is copied into the
-            // nearest already-visible ancestor.
-            if (InstallMoviePresentationFix())
-                ShimLog("startup: safe movie presentation fallback active");
+            // Outermost movie hook. MCI remains authoritative for open/play/
+            // stop/seek/timing. If MCI_UPDATE actually produces pixels we keep
+            // that path. If it returns a black frame, the presenter reads the
+            // current sample through Avifil32 from the original codec-free AVI
+            // or the shim's existing IV50 compatibility cache and blits only
+            // Battlezone's MCI_PUT destination rectangle.
+            if (InstallMovieVfwPresentationFix())
+                ShimLog("startup: adaptive VfW movie presentation fallback active");
             else
-                ShimLog("startup: safe movie presentation fallback could not be installed");
+                ShimLog("startup: adaptive VfW movie presentation fallback could not be installed");
         }
         else
         {
@@ -119,7 +119,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
-        ShutdownMoviePresentationFix();
+        ShutdownMovieVfwPresentationFix();
         ShutdownMovieGeometryProbe();
         ShutdownLegacyMovieFix();
         ShutdownFullscreenMenuFix();
