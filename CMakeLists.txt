@@ -14,6 +14,7 @@ add_library(winmm SHARED
     src/fullscreen_fix.cpp
     src/movie_fix.cpp
     src/movie_geometry_probe.cpp
+    src/movie_present_fix.cpp
     src/shim_log.cpp
     src/winmm_proxy.cpp
     src/winmm.def
