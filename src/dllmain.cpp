@@ -1,5 +1,6 @@
 #include "fullscreen_fix.h"
 #include "movie_fix.h"
+#include "movie_geometry_probe.h"
 #include "shim_log.h"
 #include "winmm_proxy.h"
 
@@ -94,10 +95,15 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
             else
                 ShimLog("startup: legacy movie hook could not be installed");
 
-            // The experimental MCI software repaint hook is intentionally not
-            // installed. Battlezone passes its shell dialog itself as the
-            // MCI_WINDOW target; forcing visibility/window changes from inside
-            // mciSendCommand re-enters ShellDlgProc and crashes before playback.
+            // Install after the IV50 fallback so this outer hook observes the
+            // final device ID even when MCI_OPEN was transparently retried on a
+            // cached DIB AVI. This probe is intentionally read-only: it logs the
+            // existing MCI_WINDOW and MCI_PUT parameters and never changes an
+            // HWND, rectangle, playback state, or device.
+            if (InstallMovieGeometryProbe())
+                ShimLog("startup: passive movie geometry probe active");
+            else
+                ShimLog("startup: passive movie geometry probe could not be installed");
         }
         else
         {
@@ -106,6 +112,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
+        ShutdownMovieGeometryProbe();
         ShutdownLegacyMovieFix();
         ShutdownFullscreenMenuFix();
         FreeRealWinmm();
