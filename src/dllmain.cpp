@@ -1,6 +1,7 @@
 #include "fullscreen_fix.h"
 #include "movie_fix.h"
 #include "movie_geometry_probe.h"
+#include "movie_present_fix.h"
 #include "shim_log.h"
 #include "winmm_proxy.h"
 
@@ -95,15 +96,21 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
             else
                 ShimLog("startup: legacy movie hook could not be installed");
 
-            // Install after the IV50 fallback so this outer hook observes the
-            // final device ID even when MCI_OPEN was transparently retried on a
-            // cached DIB AVI. This probe is intentionally read-only: it logs the
-            // existing MCI_WINDOW and MCI_PUT parameters and never changes an
-            // HWND, rectangle, playback state, or device.
+            // Keep this passive probe below the codec fallback so it sees the
+            // final device ID and the game's real WINDOW/PUT geometry.
             if (InstallMovieGeometryProbe())
                 ShimLog("startup: passive movie geometry probe active");
             else
                 ShimLog("startup: passive movie geometry probe could not be installed");
+
+            // Install outermost. It never shows/resizes/reparents the hidden MCI
+            // target. Playback is sampled only later from a timer into an
+            // off-screen DIB, then the known MCI_PUT region is copied into the
+            // nearest already-visible ancestor.
+            if (InstallMoviePresentationFix())
+                ShimLog("startup: safe movie presentation fallback active");
+            else
+                ShimLog("startup: safe movie presentation fallback could not be installed");
         }
         else
         {
@@ -112,6 +119,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
+        ShutdownMoviePresentationFix();
         ShutdownMovieGeometryProbe();
         ShutdownLegacyMovieFix();
         ShutdownFullscreenMenuFix();
