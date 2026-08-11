@@ -1,4 +1,5 @@
 #include "fullscreen_fix.h"
+#include "hud_scale.h"
 #include "movie_fix.h"
 #include "movie_geometry_probe.h"
 #include "movie_present_fix.h"
@@ -111,6 +112,13 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
             else
                 ShimLog("startup: fullscreen menu fix could not be installed; game remains stock");
 
+            // Patches bzone.exe's own 2D pass, so it is independent of every
+            // hook below and is skipped entirely when [Hud] Scale=1.
+            if (InstallHudScale())
+                ShimLog("startup: HUD scaling active");
+            else
+                ShimLog("startup: HUD scaling not installed; HUD remains stock");
+
             // Install the decoder before the movie hook. InstallLegacyMovieFix
             // decides whether to substitute a converted copy by asking VfW
             // whether the clip's codec exists, so registering IV50 first is
@@ -161,6 +169,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         ShutdownMovieGeometryProbe();
         ShutdownLegacyMovieFix();
         ShutdownVideoCodecShim();
+        ShutdownHudScale();
         ShutdownFullscreenMenuFix();
         FreeRealWinmm();
         break;
