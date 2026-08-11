@@ -240,6 +240,89 @@ convert that path to the D3D primitives.
 **Phase 4 — INI, and an opt-out.** `[Hud] Scale=` plus `Scale=1` meaning stock,
 so a regression is one line away from being disproved.
 
+## What was actually built
+
+`src/hud_scale.cpp` implements this, and five things came out differently once
+the decompile was checked against the executable's own bytes. Each is recorded
+here because each one would have been a bug.
+
+**`DrawSprite` is not reimplemented.** The stock function builds its quad and
+the finished quad is scaled on the way out, in a `Draw_D3D_Poly` hook armed for
+exactly the one call `DrawSprite` makes. Scaling a whole quad uniformly about
+the origin scales position and extent together, so the anchor flags above are
+preserved for free — a centred sprite stays centred rather than drifting by
+`(S-1)*w/2` — and the anchoring, atlas UVs, `ClipSprite` and `spriteZ` depth
+never have to be duplicated. `Draw_D3D_Poly` was verified not to clip: it only
+calls `Set_Rounding` and dispatches through `Submit_D3D_TL_Vtltbl`.
+
+**The hook scope is `DisplayInterface_RenderAll` (`0x004C870E`), not
+`RenderHUD`.** `RenderHUD` opens with `Render_Entity_Cockpit`, which is
+`Render_CachedBSP_Entity` on the cockpit model — real 3D geometry. Wrapping
+`RenderHUD` in a virtual viewport would have changed the cockpit's projection.
+`RenderHUD` also drives the software radar mesh between an `End_D3D_Scene` /
+`Begin_D3D_Scene` pair, which a virtual viewport should not straddle.
+
+**`TargetCam::Render` (`0x004DB7E6`) is excluded.** It is 3D — it calls
+`Camera_Set_Window`, `Camera_Set_Matrix` and `D3DAppSetViewport` — *and* it
+already sizes itself from the viewport at 3/4 width by 1/4 height, so it scales
+with resolution on its own. It suspends the virtual viewport for its duration.
+
+**Only the `Clipped_*` primitives are hooked.** The table above lists
+`Clipped_Rect_Filled` and `Graphic_Rect_Filled`, and `Clipped_Line` and
+`Graphic_Line`, but the `Graphic_*` pair clip against the pane and then tail
+into the `Clipped_*` pair. Hooking all four would have scaled every rectangle
+and line twice. `Graphic_Diamond` needs no hook of its own: it is four
+`Graphic_Line` calls, so radar blips scale in position and size for free.
+
+**`mousePos` is not divided.** `DisplayInterface::SimulateAll` (`0x004C8584`)
+recomputes it from the render buffer's pane extent at the top of the call and
+then hit-tests within the same call, so dividing after the call would have been
+a frame too late and overwritten immediately. Wrapping `SimulateAll` in the
+same virtual viewport makes `mousePos` come out in virtual pixels on its own.
+
+**The projected reticle scales about its own anchor.** `Reticle::Render`
+(`0x004D93C7`) does not lay the sight out in HUD coordinates. It projects the
+weapon direction through `MainCam.Const_*` and `MainCam.Orig_*`, producing a
+real screen-pixel aim point. Its `DrawSprite` quad therefore grows around that
+point instead of being multiplied about the screen origin. This enlarges the
+reticle and pitch ladder without moving where the weapon is aiming.
+
+**The hardware radar wireframe scales a copy of its points.** The terrain mesh
+is simulated while the virtual viewport is active but rendered earlier than
+the ordinary widget pass. `Render_RadarMesh` (`0x004BFCBE`) now establishes the
+same scaling scope, and `D3D_PolyLine` (`0x00545E39`) receives a temporary copy
+whose integer coordinates are multiplied by `S`. The source mesh is never
+changed, because doing so would multiply its coordinates again every frame.
+The raw-framebuffer `D3RadarType=1` path remains stock.
+
+### Offsets proven from instruction bytes
+
+`Device.Viewport` field offsets were recovered from operands rather than
+assumed:
+
+| field | offset | proof |
+|---|---|---|
+| `Width` | +0 | `cmp dword ptr [0x00D423E0], 190h` at `0x004C4AA0` and six other sites — the `400 < Viewport.Width` branch |
+| `Height` | +4 | `mov ecx,[0x00D423E4]; mov esi,1E0h; cmp ecx,esi` at `0x004C49A7` — ControlPanel's `Viewport.Height < 480` |
+| `Pane.x0/y0/x1/y1` | +28/+32/+36/+40 | `DrawSprite`'s `ClipSprite` call at `0x004FBF80` passes `[edi+1Ch]`, `[edi+20h]`, `[edi+24h]`, `[edi+28h]` with `edi = &Device` |
+
+`POINT_3D` is 24 bytes (`x, y, z, u, v, luma`), from the vertex stride in both
+`DrawSprite` and `Clipped_HW_Rect_Filled`. `DisplayInterface::SimulateAll` is
+`__cdecl(int, float)`, from the `59 59 C3` caller-side cleanup in its wrapper.
+Every hook re-checks its target's prologue bytes at install time and leaves the
+game stock if they do not match, so a different build cannot be corrupted.
+
+### Still not scaled
+
+The `D3RadarType=1` software radar mesh writes directly into a locked back
+buffer, bypassing all hardware primitives, so it keeps its stock size. The
+normal hardware wireframe and the rest of the radar (blips, compass,
+connectors, and dish) scale together.
+
+Everything drawn outside `DisplayInterface::RenderAll` also stays stock:
+`Show_framerate`, `Scores_DisplayScores`, `Network_DisplayInfo` and
+`GameFeature_RenderAll`.
+
 ## Verification
 
 The shim log should record, once per mode change: real viewport, chosen `S`,
