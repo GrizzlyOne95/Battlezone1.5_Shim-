@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Battlezone15Shim LANGUAGES CXX)
+project(Battlezone15Shim LANGUAGES C CXX)
 
 if(NOT MSVC)
     message(FATAL_ERROR "Battlezone 1.5 Shim currently requires MSVC.")
@@ -16,8 +16,17 @@ add_library(winmm SHARED
     src/movie_geometry_probe.cpp
     src/movie_present_fix.cpp
     src/shim_log.cpp
+    src/video_codec_shim.cpp
     src/winmm_proxy.cpp
     src/winmm.def
+
+    # Indeo Video 5 decoder (FFmpeg, LGPL 2.1+) -- see src/indeo/README.md
+    src/indeo_log_bridge.cpp
+    src/indeo/ffcompat.c
+    src/indeo/indeo_decode.c
+    src/indeo/indeo5.c
+    src/indeo/ivi.c
+    src/indeo/ivi_dsp.c
 )
 
 target_compile_features(winmm PRIVATE cxx_std_17)
