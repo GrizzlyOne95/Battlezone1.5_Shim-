@@ -178,14 +178,14 @@ namespace
         bool          loggedFirstFrame = false;
     };
 
+    // The id is whatever DRV_OPEN handed back, so the magic is only there to
+    // catch VfW driving us with a handle we never issued -- ICM_GETINFO, for
+    // one, arrives with id 0.
     Instance* AsInstance(DWORD_PTR id)
     {
         auto* instance = reinterpret_cast<Instance*>(id);
-        if (!instance || IsBadReadPtr(instance, sizeof(Instance)) ||
-            instance->magic != kInstanceMagic)
-        {
+        if (!instance || instance->magic != kInstanceMagic)
             return nullptr;
-        }
         return instance;
     }
 
@@ -462,9 +462,15 @@ namespace
             return ICERR_UNSUPPORTED;   // we only ever produce true colour
 
         default:
-            if (message < DRV_USER)
-                return DefDriverProc(id, driver, message, lParam1, lParam2);
-            return ICERR_UNSUPPORTED;
+            // The obvious tail here would be DefDriverProc, but that lives in
+            // winmm.dll and this shim *is* winmm.dll, so calling it would be
+            // circular. Zero is what DefDriverProc returns for every DRV_
+            // message a function-installed codec cares about (no configuration
+            // dialog, no install/remove handling), and ICERR_UNSUPPORTED tells
+            // VfW to stop asking about everything above DRV_USER -- notably the
+            // ICM_DRAW_* family, which we deliberately do not implement.
+            (void)driver;
+            return message < DRV_USER ? 0 : ICERR_UNSUPPORTED;
         }
     }
 }

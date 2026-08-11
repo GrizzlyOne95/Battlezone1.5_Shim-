@@ -1,8 +1,10 @@
 #include "fullscreen_fix.h"
+#include "hud_scale.h"
 #include "movie_fix.h"
 #include "movie_geometry_probe.h"
 #include "movie_present_vfw_fix.h"
 #include "shim_log.h"
+#include "video_codec_shim.h"
 #include "winmm_proxy.h"
 
 #include <Windows.h>
@@ -11,6 +13,25 @@
 
 namespace
 {
+    // [Movies] Codec=off restores the old behaviour (convert with ffmpeg.exe),
+    // which is worth having if the decoder ever misbehaves on a clip.
+    bool MovieCodecEnabled()
+    {
+        char path[MAX_PATH] = {};
+        if (!GetModuleFileNameA(nullptr, path, MAX_PATH))
+            return true;
+
+        char* slash = strrchr(path, '\\');
+        if (!slash)
+            return true;
+        slash[1] = '\0';
+        strcat_s(path, "bz15_shim.ini");
+
+        char value[32] = {};
+        GetPrivateProfileStringA("Movies", "Codec", "on", value, sizeof(value), path);
+        return _stricmp(value, "off") != 0 && _stricmp(value, "0") != 0;
+    }
+
     bool GetExeVersion(WORD& major, WORD& minor, WORD& build, WORD& revision)
     {
         char path[MAX_PATH] = {};
@@ -91,6 +112,31 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
             else
                 ShimLog("startup: fullscreen menu fix could not be installed; game remains stock");
 
+            // Patches bzone.exe's own 2D pass, so it is independent of every
+            // hook below and is skipped entirely when [Hud] Scale=1.
+            if (InstallHudScale())
+                ShimLog("startup: HUD scaling active");
+            else
+                ShimLog("startup: HUD scaling not installed; HUD remains stock");
+
+            // Install the decoder before the movie hook. InstallLegacyMovieFix
+            // decides whether to substitute a converted copy by asking VfW
+            // whether the clip's codec exists, so registering IV50 first is
+            // what retires the transcode path: the probe now succeeds and the
+            // stock files are played untouched.
+            if (MovieCodecEnabled())
+            {
+                if (InstallVideoCodecShim())
+                    ShimLog("startup: Indeo Video 5 decoder active");
+                else
+                    ShimLog("startup: Indeo Video 5 decoder could not be installed;"
+                            " falling back to file conversion");
+            }
+            else
+            {
+                ShimLog("startup: Indeo Video 5 decoder disabled by bz15_shim.ini");
+            }
+
             if (InstallLegacyMovieFix())
                 ShimLog("startup: legacy movie compatibility hook active");
             else
@@ -122,6 +168,8 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         ShutdownMovieVfwPresentationFix();
         ShutdownMovieGeometryProbe();
         ShutdownLegacyMovieFix();
+        ShutdownVideoCodecShim();
+        ShutdownHudScale();
         ShutdownFullscreenMenuFix();
         FreeRealWinmm();
         break;
