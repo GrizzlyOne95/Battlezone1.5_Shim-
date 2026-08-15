@@ -3,6 +3,7 @@
 #include "movie_fix.h"
 #include "movie_geometry_probe.h"
 #include "movie_present_vfw_fix.h"
+#include "shell_diag.h"
 #include "shim_log.h"
 #include "video_codec_shim.h"
 #include "winmm_proxy.h"
@@ -112,6 +113,13 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
             else
                 ShimLog("startup: fullscreen menu fix could not be installed; game remains stock");
 
+            // Install diagnostics after the compatibility fix. When the fix is
+            // active this passively wraps its D3D9 hook chain; with Mode=off it
+            // observes the game's original exclusive SetDialogBoxMode path.
+            // DiagnoseShell=off (the default) installs nothing.
+            if (InstallShellPresentationDiagnostics())
+                ShimLog("startup: passive shell presentation diagnostics active");
+
             // Patches bzone.exe's own 2D pass, so it is independent of every
             // hook below and is skipped entirely when [Hud] Scale=1.
             if (InstallHudScale())
@@ -170,6 +178,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         ShutdownLegacyMovieFix();
         ShutdownVideoCodecShim();
         ShutdownHudScale();
+        ShutdownShellPresentationDiagnostics();
         ShutdownFullscreenMenuFix();
         FreeRealWinmm();
         break;

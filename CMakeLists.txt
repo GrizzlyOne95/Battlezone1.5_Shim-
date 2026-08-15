@@ -12,6 +12,7 @@ endif()
 add_library(winmm SHARED
     src/dllmain.cpp
     src/fullscreen_fix.cpp
+    src/shell_diag.cpp
     src/hud_scale.cpp
     src/movie_fix.cpp
     src/movie_geometry_probe.cpp
