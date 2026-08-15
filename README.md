@@ -14,10 +14,10 @@
 
 [Fullscreen]
 ; Battlezone's shell (main menu, options, mission select) is a Win32 dialog
-; drawn with GDI as a child of the game window, not a D3D surface. Under an
-; exclusive D3D9 swap chain modern drivers never composite it, which is why the
-; menus are invisible until you Alt+Enter into a window. Missions are pure D3D
-; and are unaffected.
+; drawn with GDI as a child of the game window, not a D3D surface. On affected
+; modern Windows builds the exclusive D3D9 + SetDialogBoxMode path stops making
+; that dialog visible. The exact Windows presentation-stack regression is not
+; yet isolated; the fullscreen compatibility modes below bypass the broken path.
 ;
 ; mirror      : keep your desktop resolution. The game window stays 640x480 and
 ;               a fullscreen host window mirrors it with a DWM thumbnail (the
@@ -33,8 +33,13 @@
 ; center      : leave the desktop resolution alone and just centre a borderless
 ;               window. The menus are visible but stay physically 640x480.
 ;               No mode switching, so no monitor resync.
-; off         : leave the game completely stock, for comparison.
+; off         : leave the game's presentation path stock. Pair this with
+;               DiagnoseShell=on to collect passive root-cause logs.
 Mode=mirror
+
+; Passive diagnostics only; does not change D3D presentation or window state.
+; For a clean stock-path capture use Mode=off + DiagnoseShell=on.
+DiagnoseShell=off
 
 ; Only used by Mode=mirror.
 ; stretch : fill the screen. The 4:3 shell is stretched to 16:9.
