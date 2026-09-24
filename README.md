@@ -23,8 +23,8 @@
 ;               a fullscreen host window mirrors it with a DWM thumbnail (the
 ;               same mechanism as taskbar previews), scaled on the GPU and
 ;               aspect-corrected. Mouse input is mapped back into the game.
-;               No monitor mode switching at all. Missions at your native
-;               resolution bypass the mirror entirely.
+;               No monitor mode switching in the menus. Missions are not
+;               mirrored: see MirrorMissions below.
 ; displaymode : take the device out of exclusive mode so the dialog is visible
 ;               again, and put the monitor into the resolution the game asked
 ;               for so your panel upscales it -- the same thing exclusive
@@ -46,8 +46,15 @@ DiagnoseShell=off
 ; fit     : pillarbox to keep the shell's original 4:3 proportions.
 MirrorAspect=stretch
 
+; Only used by Mode=mirror. A mission below the desktop resolution either
+; switches the monitor to its mode (displaymode) or keeps being mirrored
+; (mirror, the old behaviour, which could leave input stuck mid-match).
+MirrorMissions=displaymode
+
 
 [Hud]
 Scale=5
    ; auto | 1 (stock) | 2..16
+TargetCamText=on
+   ; on | off -- scale the target camera's labels with the HUD
    ```
