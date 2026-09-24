@@ -92,7 +92,7 @@ namespace
     }
 }
 
-BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
 {
     switch (reason)
     {
@@ -173,6 +173,17 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
         break;
 
     case DLL_PROCESS_DETACH:
+        // A non-null `reserved` means the process is exiting: every other
+        // thread is already gone and we are under the loader lock. Destroying
+        // windows, unhooking, killing multimedia timers or unloading avifil32
+        // and winmm from here can deadlock the exit, and none of it matters
+        // once the process is gone -- Windows restores a CDS_FULLSCREEN
+        // display mode itself when its owner exits. Only a genuine
+        // FreeLibrary needs the full teardown.
+        // Not even ShimLog: a killed thread may have died holding its lock.
+        if (reserved)
+            break;
+
         ShutdownMovieVfwPresentationFix();
         ShutdownMovieGeometryProbe();
         ShutdownLegacyMovieFix();

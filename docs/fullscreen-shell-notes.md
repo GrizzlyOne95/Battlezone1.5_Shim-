@@ -123,6 +123,73 @@ The obvious shape: mirror only when `ResolutionMode == 0`, and give missions a
 plain borderless window at the requested size. That also removes the awkward
 case where the mirror is torn down and rebuilt on every mission entry and exit.
 
+**Done.** `ConvertExclusiveRequest` now reads `ResolutionMode` and logs
+`fullscreen: ResolutionMode=N (shell|mission) -> mirror|display mode` on every
+CreateDevice/Reset, so the assumption above is checked by every run's log. A
+value outside `0..64` falls back to the old size test. Missions below the
+desktop resolution take the `displaymode` path (monitor switched to the mission
+mode, real game window, real input); `MirrorMissions=mirror` restores the old
+behaviour.
+
+## Why mirroring a mission could leave input stuck
+
+Four things in the mirror host combined badly once a mission was mirrored:
+
+* **Nothing could reactivate the game by clicking.** The host is a topmost,
+  monitor-sized `WS_EX_NOACTIVATE` window and answers `WM_MOUSEACTIVATE` with
+  `MA_NOACTIVATE`. If anything took the foreground mid-match (Alt+Tab, an
+  overlay, a launcher, a notification that grabs focus), every click the player
+  made to get back landed on a window that refuses activation. Keyboard and the
+  game's foreground-only input stayed with the other window. The host now hands
+  activation back to the game window on click.
+
+* **The host stayed topmost over other applications.** It now tracks the
+  foreground window (`EVENT_SYSTEM_FOREGROUND`): topmost while the game is in
+  front, dropped behind whatever the player switched to otherwise.
+
+* **Captured mouse input was never mapped.** Buttons, list boxes and scroll bars
+  call `SetCapture` on a click. From then on Windows delivers real mouse
+  messages straight to that control, with the physical cursor position -- host
+  space, not game space -- so drags and releases land somewhere in the 640x480
+  corner. A thread-local `WH_GETMESSAGE` hook now remaps real mouse messages
+  aimed at the game while one of its windows holds capture, and wheel messages,
+  which go to the focus window rather than the window under the cursor.
+
+* **Missions were never written for forwarded mouse messages.** The mission is
+  pure D3D. The shell's input path (post a mapped `WM_*BUTTON*` to the child
+  under the cursor) has no business driving it. Missions are no longer mirrored
+  by default.
+
+## Other ways to put the shell on screen
+
+The shell is a fixed 640x480 GDI dialog. The options, roughly in order of how
+much they would improve on the mirror:
+
+* **Magnification API full-screen transform (`MagSetFullscreenTransform`).**
+  Windows' own magnifier transform scales the whole desktop on the GPU, and the
+  system maps mouse input through the transform itself, so no forwarding, no
+  host window and no focus games would be needed: the dialog stays a normal
+  window at the monitor origin and the player clicks it directly. Costs: the
+  scale is uniform (so `fit` only, no `stretch`), the cursor is magnified too,
+  the process must restore the transform on exit, deactivation and crash, and
+  only one process can own the full-screen magnifier at a time (it conflicts
+  with the accessibility Magnifier). This is the most promising next
+  experiment.
+
+* **Keep the DWM thumbnail, fix the edges (what the shim now does).** Works on
+  every DWM system and supports `stretch`, but input is second-hand and needs
+  the capture, wheel and focus handling above.
+
+* **`displaymode`.** No mapping at all, the panel scales -- at the cost of a
+  monitor resync on every shell/mission transition.
+
+* **Rendering the dialog through D3D.** Capture the dialog each frame
+  (`PrintWindow(PW_RENDERFULLCONTENT)`) into a texture and draw it scaled from a
+  present loop of our own. Most control over filtering and aspect, but the
+  shell's device presents only twice and then idles, so the shim would own a
+  render loop and still has to map input exactly like the mirror. Not worth it
+  over the Magnification option.
+
 ## Things worth checking before changing behaviour
 
 * Run the passive diagnostic with `Mode=off` first. That gives us the stock
