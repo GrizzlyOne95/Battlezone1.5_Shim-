@@ -55,6 +55,7 @@
 #include "shim_log.h"
 
 #include <Windows.h>
+#include <intrin.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -84,6 +85,18 @@ namespace
     // (3/4 width by 1/4 height), so it scales with resolution on its own.
     // It is suspended out of the virtual viewport for its duration.
     constexpr uintptr_t kTargetCamRender = 0x004DB7E6;
+
+    // Font_Print_String (DECOMPILE, from bzint.pdb) resolves each character
+    // to a sprite and calls DrawSprite for it. TargetCam's labels are drawn
+    // this way in real screen pixels while the virtual viewport is withdrawn,
+    // so they are the one piece of HUD text that no other part of this file
+    // scales. A DrawSprite call whose return address falls in this range is
+    // treated as a glyph. The end of the function is NOT proven from the
+    // bytes; the range is a conservative estimate, and every distinct caller
+    // seen inside TargetCam is logged once so it can be checked against the
+    // PDB.
+    constexpr uintptr_t kFontPrintString = 0x004F409E;
+    constexpr uintptr_t kFontPrintStringEstimatedEnd = kFontPrintString + 0x200;
 
     constexpr uintptr_t kDrawSprite = 0x004FBE30;
     constexpr uintptr_t kDrawD3DPoly = 0x00540BEF;
@@ -305,6 +318,9 @@ namespace
     // 0 means "auto".
     int g_configuredScale = 0;
 
+    // [Hud] TargetCamText
+    bool g_scaleTargetCamText = true;
+
     struct SavedViewport
     {
         int width = 0;
@@ -341,6 +357,17 @@ namespace
         // sprites the game has already placed in real screen pixels.
         Anchor,
     };
+
+    // TargetCam labels: every glyph in one TargetCam::Render call is scaled
+    // about the first glyph's corner, so the whole block of text grows as a
+    // unit -- glyph size, letter spacing and line spacing all by S -- instead
+    // of each glyph growing in place over its neighbours.
+    bool g_textAnchorSet = false;
+    float g_textAnchorX = 0.0f;
+    float g_textAnchorY = 0.0f;
+
+    // Distinct DrawSprite callers seen inside TargetCam, logged once each.
+    uintptr_t g_loggedTargetCamCallers[16] = {};
 
     thread_local QuadScale t_quadScale = QuadScale::None;
     thread_local float t_anchorX = 0.0f;
@@ -501,6 +528,7 @@ namespace
         {
             RestoreRealViewport();
             ++g_suspend;
+            g_textAnchorSet = false;
         }
 
         reinterpret_cast<TargetCamRenderFn>(g_targetCamHook.trampoline)(self, unused);
@@ -512,12 +540,43 @@ namespace
         }
     }
 
+    void LogTargetCamCaller(uintptr_t caller, bool text)
+    {
+        for (uintptr_t& slot : g_loggedTargetCamCallers)
+        {
+            if (slot == caller)
+                return;
+            if (slot == 0)
+            {
+                slot = caller;
+                ShimLog("hud: TargetCam DrawSprite from 0x%08X (%s)",
+                        static_cast<unsigned>(caller), text ? "text, scaled" : "not text, stock");
+                return;
+            }
+        }
+    }
+
     int __cdecl Detour_DrawSprite(void* buffer, int spriteIndex, int x, int y, int flags)
     {
         QuadScale mode = QuadScale::None;
+        bool textAnchor = false;
         if (ScalingBuffer(buffer))
         {
             mode = QuadScale::Origin;
+        }
+        else if (g_suspend > 0 && g_scale > 1 && UsingD3D() &&
+                 reinterpret_cast<uintptr_t>(buffer) == kDevice)
+        {
+            // Inside TargetCam. The detour is entered by a jmp from the
+            // patched prologue, so this is DrawSprite's own caller.
+            const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+            const bool text = caller >= kFontPrintString && caller < kFontPrintStringEstimatedEnd;
+            LogTargetCamCaller(caller, text);
+            if (text && g_scaleTargetCamText)
+            {
+                mode = QuadScale::Anchor;
+                textAnchor = true;
+            }
         }
         else if (g_reticleDepth > 0 && g_scale > 1 && UsingD3D())
         {
@@ -540,6 +599,18 @@ namespace
         {
             t_anchorX += static_cast<float>(DeviceField(kPaneX0));
             t_anchorY += static_cast<float>(DeviceField(kPaneY0));
+        }
+
+        if (textAnchor)
+        {
+            if (!g_textAnchorSet)
+            {
+                g_textAnchorSet = true;
+                g_textAnchorX = t_anchorX;
+                g_textAnchorY = t_anchorY;
+            }
+            t_anchorX = g_textAnchorX;
+            t_anchorY = g_textAnchorY;
         }
 
         const int result = reinterpret_cast<DrawSpriteFn>(g_drawSpriteHook.trampoline)(
@@ -571,8 +642,9 @@ namespace
                 else
                 {
                     // The reticle's anchor came from the real camera
-                    // projection. Grow its already-anchored quad without
-                    // moving the aim point.
+                    // projection, and TargetCam's text block is laid out in
+                    // real pixels. Grow the quad about that anchor without
+                    // moving it.
                     xy[0] = t_anchorX + (xy[0] - t_anchorX) * factor;
                     xy[1] = t_anchorY + (xy[1] - t_anchorY) * factor;
                 }
@@ -733,12 +805,26 @@ namespace
         ShimLog("hud: scale=%d (%s)", g_configuredScale, ini);
         return true;
     }
+
+    void LoadTextSettings()
+    {
+        char ini[MAX_PATH] = {};
+        BuildIniPath(ini);
+        if (!ini[0])
+            return;
+
+        char value[32] = {};
+        GetPrivateProfileStringA("Hud", "TargetCamText", "on", value, sizeof(value), ini);
+        g_scaleTargetCamText = _stricmp(value, "off") != 0 && _stricmp(value, "0") != 0;
+        ShimLog("hud: target camera text %s", g_scaleTargetCamText ? "scaled" : "stock");
+    }
 }
 
 bool InstallHudScale()
 {
     if (!LoadSettings())
         return false;
+    LoadTextSettings();
 
     // Prologues as they appear in bzone.exe 1.5.2.27. Each stolen range ends
     // on an instruction boundary and contains no relative operands.
@@ -831,5 +917,6 @@ void ShutdownHudScale()
     g_reticleDepth = 0;
     g_radarDepth = 0;
     t_quadScale = QuadScale::None;
+    g_textAnchorSet = false;
     g_scale = 1;
 }

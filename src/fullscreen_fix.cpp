@@ -39,7 +39,9 @@
 // Settings live in bz15_shim.ini next to bzone.exe:
 //
 //   [Fullscreen]
-//   Mode=displaymode  ; displaymode (default) | center | off
+//   Mode=displaymode        ; mirror | displaymode (default) | center | off
+//   MirrorAspect=stretch    ; stretch | fit              (Mode=mirror only)
+//   MirrorMissions=displaymode ; displaymode | mirror    (Mode=mirror only)
 
 #include "fullscreen_fix.h"
 #include "shim_log.h"
@@ -97,8 +99,36 @@ namespace
         Fit,
     };
 
+    // What Mode=mirror does with a mission whose resolution is below the
+    // desktop's. The mirror exists for the GDI shell; a mission is pure D3D.
+    enum class MissionScaling
+    {
+        // Switch the monitor to the mission's mode, exactly as Mode=displaymode
+        // and the stock exclusive path both do. The mission gets the real
+        // mouse, keyboard and focus, with no host window in the way.
+        DisplayMode,
+        // Keep mirroring through the DWM thumbnail. No mode switch, but the
+        // mission is then played through the host window's forwarded mouse
+        // messages, which in-mission mouse handling was never written for.
+        Mirror,
+    };
+
     Mode g_mode = Mode::DisplayMode;
     MirrorAspect g_mirrorAspect = MirrorAspect::Stretch;
+    MissionScaling g_missionScaling = MissionScaling::DisplayMode;
+
+    // ResolutionMode: zero while the shell is up, otherwise an index into
+    // VideoMode[] for the mission resolution. bzone.exe 1.5.2.27 is
+    // RELOCS_STRIPPED with no DYNAMIC_BASE, so the address is fixed, and
+    // DllMain only installs this fix after checking that exact version.
+    // D3D_Change_Mode_Ex assigns it before calling D3DAppIResetDevice, so it
+    // is already current when the CreateDevice/Reset hooks below run.
+    constexpr uintptr_t kResolutionMode = 0x00CD5B44;
+
+    int ReadResolutionMode()
+    {
+        return *reinterpret_cast<const volatile int*>(kResolutionMode);
+    }
 
     bool g_active = false;
     HWND g_gameWindow = nullptr;
@@ -161,7 +191,14 @@ namespace
         GetPrivateProfileStringA("Fullscreen", "MirrorAspect", "stretch", aspect, sizeof(aspect), ini);
         g_mirrorAspect = (_stricmp(aspect, "fit") == 0) ? MirrorAspect::Fit : MirrorAspect::Stretch;
 
-        ShimLog("fullscreen: settings mode=%s mirrorAspect=%s (%s)", mode, aspect, ini);
+        char missions[32] = {};
+        GetPrivateProfileStringA("Fullscreen", "MirrorMissions", "displaymode", missions, sizeof(missions), ini);
+        g_missionScaling = (_stricmp(missions, "mirror") == 0)
+            ? MissionScaling::Mirror
+            : MissionScaling::DisplayMode;
+
+        ShimLog("fullscreen: settings mode=%s mirrorAspect=%s mirrorMissions=%s (%s)",
+                mode, aspect, missions, ini);
     }
 
     bool PatchPointer(void** slot, void* replacement, void** original)
@@ -449,17 +486,49 @@ namespace
         return out;
     }
 
+    bool g_mirrorShown = false;
+
+    // Foreground tracking and captured-mouse remapping; see EnsureHostWindow.
+    HWINEVENTHOOK g_foregroundHook = nullptr;
+    HHOOK g_messageHook = nullptr;
+
+    bool IsGameWindow(HWND hwnd)
+    {
+        return hwnd && g_gameWindow &&
+               (hwnd == g_gameWindow || IsChild(g_gameWindow, hwnd));
+    }
+
+    // Map a point in host client space into the game's client space.
+    bool HostToGameClient(POINT hostPoint, bool clamp, POINT& out)
+    {
+        const LONG destW = g_mirrorDest.right - g_mirrorDest.left;
+        const LONG destH = g_mirrorDest.bottom - g_mirrorDest.top;
+        if (destW <= 0 || destH <= 0 || g_logicalW <= 0 || g_logicalH <= 0)
+            return false;
+
+        LONG x = static_cast<LONG>(
+            (static_cast<long long>(hostPoint.x - g_mirrorDest.left) * g_logicalW) / destW);
+        LONG y = static_cast<LONG>(
+            (static_cast<long long>(hostPoint.y - g_mirrorDest.top) * g_logicalH) / destH);
+
+        if (clamp)
+        {
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x > g_logicalW - 1) x = g_logicalW - 1;
+            if (y > g_logicalH - 1) y = g_logicalH - 1;
+        }
+
+        out = { x, y };
+        return true;
+    }
+
     // Map a point in host client space back into the game's client space, then
     // walk down to whichever child window actually sits under it so the dialog's
     // own controls receive coordinates in their own space.
     void ForwardMouseToGame(UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (!g_gameWindow || !IsWindow(g_gameWindow))
-            return;
-
-        const LONG destW = g_mirrorDest.right - g_mirrorDest.left;
-        const LONG destH = g_mirrorDest.bottom - g_mirrorDest.top;
-        if (destW <= 0 || destH <= 0 || g_logicalW <= 0 || g_logicalH <= 0)
             return;
 
         POINT hostPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -469,18 +538,11 @@ namespace
             ScreenToClient(g_host, &hostPoint);
         }
 
-        LONG x = static_cast<LONG>(
-            (static_cast<long long>(hostPoint.x - g_mirrorDest.left) * g_logicalW) / destW);
-        LONG y = static_cast<LONG>(
-            (static_cast<long long>(hostPoint.y - g_mirrorDest.top) * g_logicalH) / destH);
-
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-        if (x > g_logicalW - 1) x = g_logicalW - 1;
-        if (y > g_logicalH - 1) y = g_logicalH - 1;
+        POINT local = {};
+        if (!HostToGameClient(hostPoint, true, local))
+            return;
 
         HWND target = g_gameWindow;
-        POINT local = { x, y };
         for (int depth = 0; depth < 8; ++depth)
         {
             HWND child = ChildWindowFromPointEx(
@@ -508,12 +570,112 @@ namespace
                      MAKELPARAM(static_cast<WORD>(local.x), static_cast<WORD>(local.y)));
     }
 
+    // While the mirror is up the host covers the whole monitor, so the game's
+    // own windows only ever see *real* mouse input in two cases: a control
+    // that has called SetCapture (buttons, list boxes and scroll bars all do
+    // on a click), and the wheel, which Windows sends to the focus window
+    // rather than the window under the cursor. Both arrive with the physical
+    // cursor position, which is in host space, not game space -- so a
+    // captured drag or a released button lands somewhere in the 640x480
+    // corner of the screen instead of under the pointer. Remap them here,
+    // on the game's own UI thread, before the control sees them.
+    void RemapRealMouseMessage(MSG& msg)
+    {
+        const bool wheel = msg.message == WM_MOUSEWHEEL || msg.message == WM_MOUSEHWHEEL;
+        if (!wheel && !IsGameWindow(GetCapture()))
+            return;
+
+        POINT reported = { GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam) };
+        if (!wheel)
+            ClientToScreen(msg.hwnd, &reported);
+
+        // Messages ForwardMouseToGame posted already carry game-space
+        // coordinates. Only raw input still agrees with the physical cursor
+        // position recorded in msg.pt.
+        if (reported.x != msg.pt.x || reported.y != msg.pt.y)
+            return;
+
+        POINT hostPoint = msg.pt;
+        ScreenToClient(g_host, &hostPoint);
+
+        POINT mapped = {};
+        if (!HostToGameClient(hostPoint, false, mapped))
+            return;
+
+        ClientToScreen(g_gameWindow, &mapped);
+        if (!wheel)
+            ScreenToClient(msg.hwnd, &mapped);
+
+        msg.lParam = MAKELPARAM(static_cast<WORD>(mapped.x), static_cast<WORD>(mapped.y));
+    }
+
+    LRESULT CALLBACK MirrorMessageHook(int code, WPARAM wParam, LPARAM lParam)
+    {
+        // PM_NOREMOVE peeks leave the message queued and it passes through
+        // here again when it is removed, so only rewrite it once.
+        if (code == HC_ACTION && wParam == PM_REMOVE && g_mirrorShown)
+        {
+            MSG* msg = reinterpret_cast<MSG*>(lParam);
+            if (msg && msg->message >= WM_MOUSEFIRST && msg->message <= WM_MOUSELAST &&
+                IsGameWindow(msg->hwnd))
+            {
+                RemapRealMouseMessage(*msg);
+            }
+        }
+
+        return CallNextHookEx(g_messageHook, code, wParam, lParam);
+    }
+
+    bool BelongsToGame(HWND hwnd)
+    {
+        if (!hwnd || !g_gameWindow)
+            return false;
+        if (hwnd == g_host)
+            return true;
+        return GetAncestor(hwnd, GA_ROOTOWNER) == GetAncestor(g_gameWindow, GA_ROOTOWNER);
+    }
+
+    // The host is WS_EX_TOPMOST so it can cover the taskbar. That must only
+    // hold while the game is in front: otherwise Alt+Tab, a launcher or an
+    // overlay taking the foreground leaves a black topmost rectangle over
+    // everything, and every click the player makes to get back is swallowed
+    // by a window that refuses activation.
+    void CALLBACK ForegroundChanged(
+        HWINEVENTHOOK, DWORD, HWND foreground, LONG, LONG, DWORD, DWORD)
+    {
+        if (!g_mirrorShown || !g_host || !IsWindow(g_host) || !foreground)
+            return;
+
+        constexpr UINT kFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+
+        if (BelongsToGame(foreground))
+        {
+            SetWindowPos(g_host, HWND_TOPMOST, 0, 0, 0, 0, kFlags | SWP_SHOWWINDOW);
+            return;
+        }
+
+        SetWindowPos(g_host, HWND_NOTOPMOST, 0, 0, 0, 0, kFlags);
+        if ((GetWindowLongA(foreground, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0)
+            SetWindowPos(g_host, foreground, 0, 0, 0, 0, kFlags);
+    }
+
     LRESULT CALLBACK HostWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         switch (message)
         {
         case WM_MOUSEACTIVATE:
-            // Never steal focus: the dialog needs to keep the keyboard.
+            // Never take focus: the dialog needs to keep the keyboard. But a
+            // click here is also the player trying to get back into the game,
+            // so if something else holds the foreground, give it back to the
+            // game window. Without this the game could never be reactivated
+            // by clicking -- the only window under the cursor refuses
+            // activation -- and keyboard and mouse stay with whatever stole
+            // focus.
+            if (g_gameWindow && IsWindow(g_gameWindow) &&
+                !BelongsToGame(GetForegroundWindow()))
+            {
+                SetForegroundWindow(g_gameWindow);
+            }
             return MA_NOACTIVATE;
 
         case WM_NCHITTEST:
@@ -556,6 +718,8 @@ namespace
 
     void HideMirror()
     {
+        g_mirrorShown = false;
+
         if (g_thumbnail)
         {
             DwmUnregisterThumbnail(g_thumbnail);
@@ -569,6 +733,18 @@ namespace
     void DestroyMirror()
     {
         HideMirror();
+
+        if (g_messageHook)
+        {
+            UnhookWindowsHookEx(g_messageHook);
+            g_messageHook = nullptr;
+        }
+
+        if (g_foregroundHook)
+        {
+            UnhookWinEvent(g_foregroundHook);
+            g_foregroundHook = nullptr;
+        }
 
         if (g_host && IsWindow(g_host))
             DestroyWindow(g_host);
@@ -621,6 +797,28 @@ namespace
         }
 
         ShimLog("mirror: host window created");
+
+        // Both hooks are thread-local to the game's UI thread and live as
+        // long as the host. The WinEvent callback is delivered through that
+        // thread's message loop, so it never runs concurrently with the game.
+        const DWORD gameThread = GetWindowThreadProcessId(g_gameWindow, nullptr);
+        if (!g_messageHook)
+        {
+            g_messageHook = SetWindowsHookExA(WH_GETMESSAGE, &MirrorMessageHook, nullptr, gameThread);
+            if (!g_messageHook)
+                ShimLog("mirror: WH_GETMESSAGE hook failed (err=%lu); captured drags stay unmapped",
+                        GetLastError());
+        }
+
+        if (!g_foregroundHook)
+        {
+            g_foregroundHook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                &ForegroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT);
+            if (!g_foregroundHook)
+                ShimLog("mirror: foreground WinEvent hook failed; host stays topmost");
+        }
+
         return true;
     }
 
@@ -732,6 +930,13 @@ namespace
         }
 
         InvalidateRect(g_host, nullptr, TRUE);
+        g_mirrorShown = true;
+
+        // Created or re-shown while something else is in front (the game can
+        // Reset while alt-tabbed): do not sit topmost over that window.
+        HWND foreground = GetForegroundWindow();
+        if (foreground && !BelongsToGame(foreground))
+            ForegroundChanged(nullptr, EVENT_SYSTEM_FOREGROUND, foreground, OBJID_WINDOW, 0, 0, 0);
 
         ShimLog(
             "mirror: mirroring %ldx%ld (DWM source %ldx%ld) into %ld,%ld %ldx%ld on a %ldx%ld screen",
@@ -843,13 +1048,44 @@ namespace
         g_logicalW = static_cast<LONG>(requested.BackBufferWidth);
         g_logicalH = static_cast<LONG>(requested.BackBufferHeight);
 
-        if (g_mode == Mode::DisplayMode)
+        // Mode=mirror exists for the GDI shell. A mission is pure D3D, and
+        // mirroring one means playing it through a topmost host window whose
+        // forwarded mouse messages the mission's input handling was never
+        // written for. Unless MirrorMissions=mirror asks for the old
+        // behaviour, a mission is given the display-mode treatment instead.
+        bool mirroring = false;
+        if (g_mode == Mode::Mirror)
+        {
+            const int resolutionMode = ReadResolutionMode();
+            bool inShell = resolutionMode == 0;
+            if (resolutionMode < 0 || resolutionMode > 64)
+            {
+                // Not a plausible VideoMode[] index; fall back to the size
+                // test the fix has always used.
+                MONITORINFOEXA probe = {};
+                inShell = !GetMonitorDevice(deviceWindow, probe) ||
+                          g_logicalW < probe.rcMonitor.right - probe.rcMonitor.left ||
+                          g_logicalH < probe.rcMonitor.bottom - probe.rcMonitor.top;
+            }
+
+            mirroring = inShell || g_missionScaling == MissionScaling::Mirror;
+            ShimLog("fullscreen: ResolutionMode=%d (%s) -> %s",
+                    resolutionMode, inShell ? "shell" : "mission",
+                    mirroring ? "mirror" : "display mode");
+        }
+
+        if (g_mode == Mode::DisplayMode || (g_mode == Mode::Mirror && !mirroring))
         {
             ApplyLegacyDisplayMode(
                 deviceWindow,
                 requested.BackBufferWidth,
                 requested.BackBufferHeight,
                 requested.FullScreen_RefreshRateInHz);
+        }
+        else if (g_mode == Mode::Mirror)
+        {
+            // Back in the shell after a mission switched the monitor.
+            RestoreDesktopMode();
         }
 
         MONITORINFOEXA monitor = {};
@@ -862,15 +1098,15 @@ namespace
 
         bool wantMirror = false;
 
-        if (g_mode == Mode::Mirror)
+        if (mirroring)
         {
             const LONG monitorW = g_monitorRect.right - g_monitorRect.left;
             const LONG monitorH = g_monitorRect.bottom - g_monitorRect.top;
 
             if (g_logicalW >= monitorW && g_logicalH >= monitorH)
             {
-                // A mission at the native resolution has nothing to magnify, so
-                // the game window just becomes a normal borderless fullscreen.
+                // Nothing to magnify, so the game window just becomes a
+                // normal borderless fullscreen.
                 HideMirror();
                 g_windowRect = g_monitorRect;
             }
@@ -886,11 +1122,15 @@ namespace
                 wantMirror = true;
             }
         }
-        else if (!ComputeWindowRect(
-                     deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight, g_windowRect))
+        else
         {
-            ShimLog("fullscreen: could not resolve monitor geometry; leaving the request stock");
-            return false;
+            HideMirror();
+            if (!ComputeWindowRect(
+                    deviceWindow, requested.BackBufferWidth, requested.BackBufferHeight, g_windowRect))
+            {
+                ShimLog("fullscreen: could not resolve monitor geometry; leaving the request stock");
+                return false;
+            }
         }
 
         g_active = true;

@@ -312,6 +312,16 @@ assumed:
 Every hook re-checks its target's prologue bytes at install time and leaves the
 game stock if they do not match, so a different build cannot be corrupted.
 
+**TargetCam's labels scale as one block.** The virtual viewport is withdrawn
+for all of `TargetCam::Render`, so its text was left at stock size. Inside
+TargetCam, a `DrawSprite` whose return address lies in `Font_Print_String`
+(`0x004F409E`) is treated as a glyph, and every glyph in one TargetCam call is
+scaled about the first glyph's corner -- glyph size, letter spacing and line
+spacing together, so lines do not overlap. The end of `Font_Print_String` is
+**ASSUMED** (`+0x200`); each distinct `DrawSprite` caller seen inside TargetCam
+is logged once (`hud: TargetCam DrawSprite from 0x...`) so the range can be
+checked against the PDB. `[Hud] TargetCamText=off` restores stock.
+
 ### Still not scaled
 
 The `D3RadarType=1` software radar mesh writes directly into a locked back
